@@ -1,0 +1,38 @@
+# ── 비밀 정보 (절대 커밋 금지) ──────────────────────────────
+.streamlit/secrets.toml
+.streamlit/secrets.toml.local
+.env
+*.key
+*.pem
+
+# secrets.toml.example 은 값이 비어 있는 양식이므로 커밋합니다.
+# 실제 키를 example 에 적지 마세요.
+
+# ── 회원 / 사용자 업로드 데이터 (개인정보) ──────────────────
+data/users.db
+data/users/
+*.db
+*.sqlite
+*.sqlite3
+
+# ── 파이썬 ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+lightning_logs/
+
+# ── 실행 시 생성되는 결과물 ─────────────────────────────────
+analysis_output/
+*.log
+
+# ── OS / 편집기 ─────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
