@@ -4,7 +4,7 @@
 (예: "Username and Password not accepted") 원인을 짚어주지 않으면 헤매기 쉽다.
 
   사용법
-    .venv\\Scripts\\python.exe check_email.py           접속·로그인만 확인 (메일 발송 없음)
+    .venv\\Scripts\\python.exe check_email.py           접속, 로그인만 확인 (메일 발송 없음)
     .venv\\Scripts\\python.exe check_email.py --send     실제 테스트 메일 1통 발송
 
   --send 는 secrets.toml 의 sender 주소, 즉 본인에게만 보낸다.
@@ -38,7 +38,7 @@ def main():
 
     print()
     print("=" * 62)
-    print("  Biz Forecaster — 이메일 발송 설정 확인")
+    print("  Biz Forecaster - 이메일 발송 설정 확인")
     print("=" * 62)
 
     # --- 1. 설정 읽기 --------------------------------------------------------
@@ -66,7 +66,7 @@ def main():
             f"    1) {SECRETS} 파일에 [email] 블록 추가\n"
             "       (secrets.toml.example 을 복사해 쓰면 됩니다)\n"
             "    2) 환경변수 BIZ_EMAIL_SENDER / BIZ_EMAIL_PASSWORD 설정\n"
-            "       (Docker·Render 등 배포 환경용)",
+            "       (Docker, Render 등 배포 환경용)",
         )
 
     print(f"\n  설정 출처   : {source}")
@@ -103,7 +103,7 @@ def main():
     host, port, use_starttls = SMTP_PROFILES[provider]
     print(f"  서버        : {host}:{port} ({'STARTTLS' if use_starttls else 'SSL'})")
 
-    # --- 2. 접속 · 로그인 ----------------------------------------------------
+    # --- 2. 접속, 로그인 ----------------------------------------------------
     print("\n  접속을 시도합니다...")
     try:
         if use_starttls:
@@ -115,8 +115,8 @@ def main():
                                       context=ssl.create_default_context())
     except (OSError, smtplib.SMTPException) as e:
         fail(
-            f"메일 서버에 접속하지 못했습니다: {type(e).__name__} — {e}",
-            "회사·학교 네트워크나 백신이 587 포트를 막고 있을 수 있습니다.\n"
+            f"메일 서버에 접속하지 못했습니다: {type(e).__name__} - {e}",
+            "회사, 학교 네트워크나 백신이 587 포트를 막고 있을 수 있습니다.\n"
             f"  secrets.toml 의 provider 를 \"{provider}_ssl\" 로 바꿔 465 포트로 시도해보세요."
             if not provider.endswith("_ssl") else "네트워크 연결을 확인해주세요.",
         )
@@ -129,16 +129,16 @@ def main():
         fail(
             f"로그인이 거부되었습니다. (서버 응답: {e.smtp_code})",
             "가장 흔한 원인 순서대로:\n"
-            "    1) 일반 로그인 비밀번호를 넣은 경우 — 반드시 '앱 비밀번호'여야 합니다\n"
-            "    2) 2단계 인증이 꺼져 있는 경우 — 켜야 앱 비밀번호를 만들 수 있습니다\n"
+            "    1) 일반 로그인 비밀번호를 넣은 경우 - 반드시 '앱 비밀번호'여야 합니다\n"
+            "    2) 2단계 인증이 꺼져 있는 경우 - 켜야 앱 비밀번호를 만들 수 있습니다\n"
             "    3) sender 주소와 앱 비밀번호를 만든 계정이 다른 경우\n"
             "    4) (네이버) 메일 환경설정에서 IMAP/SMTP 사용이 꺼져 있는 경우",
         )
     except smtplib.SMTPException as e:
         server.quit()
-        fail(f"로그인 중 오류: {type(e).__name__} — {e}")
+        fail(f"로그인 중 오류: {type(e).__name__} - {e}")
 
-    print("\n  ✅ 로그인 성공 — 이메일 발송 설정이 정상입니다.")
+    print("\n  로그인 성공 - 이메일 발송 설정이 정상입니다.")
 
     # --- 3. 실제 발송 (선택) -------------------------------------------------
     if not send_test:
@@ -164,9 +164,9 @@ def main():
         server.send_message(msg)
         server.quit()
     except smtplib.SMTPException as e:
-        fail(f"발송에 실패했습니다: {type(e).__name__} — {e}")
+        fail(f"발송에 실패했습니다: {type(e).__name__} - {e}")
 
-    print(f"\n  ✅ 발송 완료 — {sender} 메일함을 확인해주세요.")
+    print(f"\n  발송 완료 - {sender} 메일함을 확인해주세요.")
     print("     (인증코드 123456 짜리 테스트 메일입니다)")
     print("     스팸함에 들어갔다면 '스팸 아님'으로 표시해두세요.")
     print()
