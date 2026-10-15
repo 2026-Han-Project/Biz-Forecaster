@@ -6,11 +6,11 @@
 
 세 관리도는 서로 다른 이상 유형에 강하다 (이게 3종을 다 구현하는 이유다):
 
-    Shewhart 3σ : 단발성 급변(spike)에 강함.   점진적 드리프트는 거의 못 잡는다.
+    Shewhart 3시그마 : 단발성 급변(spike)에 강함.   점진적 드리프트는 거의 못 잡는다.
     EWMA        : 완만한 평균 이동에 강함.      과거를 지수가중으로 기억한다.
     CUSUM       : 작은 편차의 누적에 가장 강함. 챔버 오염처럼 서서히 쌓이는 이상용.
 
-공통 설계 원칙 — 셀프마스킹(self-masking) 방지
+공통 설계 원칙 - 셀프마스킹(self-masking) 방지
     당일 값을 자기 관리한계 계산에 넣으면, 이상치가 자기 기준선을 끌어올려
     스스로를 정상으로 만들어 버린다. 그래서 모든 관리한계는 series.shift(1),
     즉 '전날까지의 값'만으로 계산한다.
@@ -26,7 +26,7 @@ except ImportError:
     _SKLEARN_OK = False
 
 
-# 교과서 기준 ARL0(관리상태 평균런길이) — 이상이 없을 때 오경보가 뜨기까지의 평균 관측 수.
+# 교과서 기준 ARL0(관리상태 평균런길이) - 이상이 없을 때 오경보가 뜨기까지의 평균 관측 수.
 # 클수록 오탐이 적다. 실측 ARL0와 비교하면 파라미터가 적절한지 판단할 수 있다.
 NOMINAL_ARL0 = {
     "3시그마": 370.4,   # 정규분포에서 |z|>3 확률 0.0027 -> 1/0.0027
@@ -88,7 +88,7 @@ def ewma_chart(series, lam=0.2, L=3.0, window=28, min_periods=10, non_negative=T
 
 
 def cusum_chart(series, k=0.5, h=5.0, window=28, min_periods=10):
-    """표형(tabular) CUSUM 관리도. — 팀원 C 파트에서 새로 추가한 세 번째 관리도.
+    """표형(tabular) CUSUM 관리도. - 팀원 C 파트에서 새로 추가한 세 번째 관리도.
 
     표준화한 편차 z_t = (x_t - center_t) / sigma_t 를 누적한다:
 
@@ -101,7 +101,7 @@ def cusum_chart(series, k=0.5, h=5.0, window=28, min_periods=10):
     h(decision interval)는 경보 문턱. h를 키우면 오탐이 줄고 탐지가 늦어진다.
 
     3시그마가 '한 방에 크게 튀어야' 잡는 반면, CUSUM은 0.5시그마씩 며칠 연속 밀리는
-    작은 편차도 누적해서 잡아낸다. 반도체에서 챔버 오염·타겟 소모처럼 서서히 진행되는
+    작은 편차도 누적해서 잡아낸다. 반도체에서 챔버 오염, 타겟 소모처럼 서서히 진행되는
     드리프트를 잡는 데 CUSUM을 쓰는 이유가 이것이다.
 
     경보 후에는 C+/C-를 0으로 리셋한다(재시작). 리셋하지 않으면 한 번 넘긴 뒤
@@ -117,7 +117,7 @@ def cusum_chart(series, k=0.5, h=5.0, window=28, min_periods=10):
     prev_pos = prev_neg = 0.0
     for i, zi in enumerate(z.values):
         if np.isnan(zi):
-            # 기준선을 아직 못 만든 워밍업 구간 — 누적하지 않고 통과시킨다.
+            # 기준선을 아직 못 만든 워밍업 구간 - 누적하지 않고 통과시킨다.
             c_pos[i] = c_neg[i] = 0.0
             continue
         cur_pos = max(0.0, prev_pos + zi - k)
@@ -141,7 +141,7 @@ def cusum_chart(series, k=0.5, h=5.0, window=28, min_periods=10):
 
 
 def isolation_forest_flags(series, contamination=0.05, random_state=42):
-    """Isolation Forest — 값·요일·7일이동평균 대비 편차를 피처로 쓰는 비지도 이상탐지.
+    """Isolation Forest - 값, 요일, 7일이동평균 대비 편차를 피처로 쓰는 비지도 이상탐지.
 
     관리도와 결정적으로 다른 점: contamination 비율만큼을 '항상' 이상으로 뽑는다.
     즉 정상만 있는 구간에서도 5%는 무조건 경보가 뜬다. 절대적 관리한계가 없고
@@ -204,7 +204,7 @@ def run_all_detectors(series, L=3.0, lam=0.2, ewma_L=3.0,
 
 
 # -----------------------------------------------------------------------------
-# 잔차 관리도 — 관리도의 전제(정상상태)를 맞춰주는 전처리
+# 잔차 관리도 - 관리도의 전제(정상상태)를 맞춰주는 전처리
 # -----------------------------------------------------------------------------
 
 def weekday_residual(series, n_weeks=4, min_periods=2):

@@ -1,4 +1,4 @@
-"""이메일 인증코드 발송 — 네이버 / 구글(Gmail) SMTP.
+"""이메일 인증코드 발송 - 네이버 / 구글(Gmail) SMTP.
 
 두 서비스 모두 표준 SMTP를 열어두고 있어서, 별도 SDK 없이 파이썬 표준
 라이브러리(smtplib, email)만으로 보낼 수 있다. 발송 계정 정보는 코드가 아니라
@@ -64,7 +64,7 @@ def _cfg_from_streamlit_secrets():
 
     Streamlit Community Cloud는 앱 설정의 Secrets 칸에 붙여넣은 내용을 실행 시점에
     주입해준다. 그래서 secrets.toml을 .gitignore에 넣어 저장소에서 빼두어도
-    배포된 앱은 정상적으로 읽는다 — 비밀키를 코드 저장소에 두지 않기 위한 구조다.
+    배포된 앱은 정상적으로 읽는다 - 비밀키를 코드 저장소에 두지 않기 위한 구조다.
     """
     try:
         import streamlit as st
@@ -77,7 +77,7 @@ def _cfg_from_streamlit_secrets():
 def _cfg_from_env():
     """환경변수에서 읽는다 (Streamlit Cloud가 아닌 배포 환경용).
 
-    Docker·Render·Railway·회사 서버처럼 Secrets 입력란이 없는 곳에서는
+    Docker, Render, Railway, 회사 서버처럼 Secrets 입력란이 없는 곳에서는
     환경변수가 그 자리를 대신한다. 여기서도 설정 값이 코드에 들어가지 않는다.
 
         BIZ_EMAIL_PROVIDER=gmail
@@ -101,7 +101,7 @@ def load_email_config():
     """발송 설정을 읽는다. 없으면 None (개발 모드).
 
     secrets를 먼저 보고, 없으면 환경변수를 본다. 두 경로를 모두 지원해야
-    로컬 실행 · Streamlit Cloud 배포 · 컨테이너 배포가 같은 코드로 동작한다.
+    로컬 실행, Streamlit Cloud 배포, 컨테이너 배포가 같은 코드로 동작한다.
     """
     cfg = _cfg_from_streamlit_secrets() or _cfg_from_env()
     if not cfg:
@@ -145,8 +145,8 @@ def _build_message(cfg, to_email, code, purpose):
     msg.add_alternative(
         f"""\
 <html><body style="font-family:'Malgun Gothic',sans-serif;line-height:1.7;color:#222">
-  <h2 style="margin-bottom:4px">🥐 Biz Forecaster</h2>
-  <p style="color:#666;margin-top:0">소상공인 AI 수요예측 · 이상탐지 플랫폼</p>
+  <h2 style="margin-bottom:4px">Biz Forecaster</h2>
+  <p style="color:#666;margin-top:0">소상공인 AI 수요예측, 이상탐지 플랫폼</p>
   <hr style="border:none;border-top:1px solid #eee">
   <p>{title} 인증코드입니다. 아래 6자리를 입력창에 넣어주세요.</p>
   <p style="font-size:30px;font-weight:bold;letter-spacing:8px;
@@ -196,4 +196,4 @@ def send_verification_code(to_email, code, purpose="signup", timeout=15):
     except smtplib.SMTPRecipientsRefused:
         return False, "받는 사람 주소가 거부되었습니다. 이메일을 다시 확인해주세요."
     except (smtplib.SMTPException, OSError) as e:
-        return False, f"메일 발송에 실패했습니다: {type(e).__name__} — {e}"
+        return False, f"메일 발송에 실패했습니다: {type(e).__name__} - {e}"

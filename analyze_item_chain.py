@@ -1,16 +1,16 @@
-"""H2′ 검증 — 품목간 수요연쇄 (선행 품목 → 후행 품목 리드-래그 분석).
+"""H2 검증 - 품목간 수요연쇄 (선행 품목 -> 후행 품목 리드-래그 분석).
 
 앱 화면에서는 뺐다. 소상공인이 매일 볼 화면이 아니라 "이 방법이 예측을 개선하는가"를
-증명하는 연구용이기 때문이다. 발표·보고서에 필요할 때 이 스크립트로 재현한다.
+증명하는 연구용이기 때문이다. 발표, 보고서에 필요할 때 이 스크립트로 재현한다.
 
   가설
     어떤 품목이 팔리면 며칠 뒤 다른 품목이 팔린다. 그 시차 관계를 예측에 넣으면
     각 품목을 따로 예측할 때보다 정확해진다.
 
   검증 3단계
-    1. 시차 찾기   — 1~14일 중 두 계열의 교차상관이 가장 큰 간격 L*
-    2. 인과성 검정 — Granger 검정. '같이 움직이는 것'과 '앞선 것이 뒤를 예측하는 것'을 가른다
-    3. 예측 반영   — 선행 품목의 L*일 전 값을 후행 품목 예측에 더하고 WAPE가 줄었는지 본다
+    1. 시차 찾기 - 1~14일 중 두 계열의 교차상관이 가장 큰 간격 L*
+    2. 인과성 검정 - Granger 검정. '같이 움직이는 것'과 '앞선 것이 뒤를 예측하는 것'을 가른다
+    3. 예측 반영 - 선행 품목의 L*일 전 값을 후행 품목 예측에 더하고 WAPE가 줄었는지 본다
 
   사용법
     .venv\\Scripts\\python.exe analyze_item_chain.py
@@ -34,7 +34,7 @@ TEST_DAYS = 30          # 마지막 30일을 떼어 백테스트
 
 
 def find_optimal_lag(leading, lagging, min_lag=1, max_lag=14):
-    """leading(선행 일별 판매량) ↔ lagging(후행) 교차상관으로 최적 시차 L*를 탐색."""
+    """leading(선행 일별 판매량) <-> lagging(후행) 교차상관으로 최적 시차 L*를 탐색."""
     best_lag, best_corr = min_lag, 0.0
     corr_by_lag = {}
     for lag in range(min_lag, max_lag + 1):
@@ -68,14 +68,14 @@ def granger_pvalue(lagging, leading, lag):
             result = grangercausalitytests(data, maxlag=[lag], verbose=False)
         return result[lag][0]['ssr_ftest'][1]
     except Exception as e:
-        print(f"  [경고] Granger 검정 실패: {type(e).__name__} — {e}")
+        print(f"  [경고] Granger 검정 실패: {type(e).__name__} - {e}")
         return None
 
 
 def fit_item_chain_gain(lagging_train, leading_lagged_train):
-    """후행 품목의 '자체 기저치 대비 잔차'를 선행 품목의 시차 신호로 회귀해 γ를 추정.
+    """후행 품목의 '자체 기저치 대비 잔차'를 선행 품목의 시차 신호로 회귀해 gamma를 추정.
 
-    'ŷ_final = ŷ_base x (1+Σβₖeₖ) + γ·x_item(t−L*)' 융합식의 가산항에 대응한다.
+    'y_hat_final = y_hat_base x (1+sumbeta_ke_k) + gamma, x_item(t-L*)' 융합식의 가산항에 대응한다.
     """
     baseline = lagging_train.rolling(14, center=True, min_periods=7).median()
     baseline = baseline.bfill().ffill()
@@ -94,14 +94,14 @@ def predict_item_chain(base_forecast, reg, leading_lagged_test):
 
 
 def compute_wape(actual, pred):
-    """WAPE — 실제값 합 대비 절대오차 합의 비율(%). 작을수록 정확하다."""
+    """WAPE - 실제값 합 대비 절대오차 합의 비율(%). 작을수록 정확하다."""
     actual, pred = np.asarray(actual, float), np.asarray(pred, float)
     denom = np.abs(actual).sum()
     return float(np.abs(actual - pred).sum() / denom * 100) if denom else float("nan")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="H2′ 품목간 수요연쇄 검증")
+    ap = argparse.ArgumentParser(description="H2 품목간 수요연쇄 검증")
     ap.add_argument("--csv", default=str(DEFAULT_CSV))
     ap.add_argument("--by", default="item", choices=["item", "category"],
                     help="품목 단위로 볼지 카테고리 단위로 볼지")
@@ -176,7 +176,7 @@ def main():
     pd.set_option("display.width", 200)
     print()
     print("=" * 88)
-    print("  H2′ 검증 결과 — '개선'이 양수면 연쇄를 반영해 예측이 좋아진 것")
+    print("  H2 검증 결과 - '개선'이 양수면 연쇄를 반영해 예측이 좋아진 것")
     print("=" * 88)
     print(res.head(args.top).to_string(index=False))
 
@@ -192,7 +192,7 @@ def main():
               f"(시차 {b['시차(일)']}일, WAPE {b['기저 WAPE']}% -> {b['연쇄 WAPE']}%)")
     else:
         print("  통계적으로 확실한 연쇄 관계는 확인되지 않았습니다.")
-        print("  이것도 유효한 검증 결과입니다 — 가설이 기각된 것이지 분석이 실패한 게 아닙니다.")
+        print("  이것도 유효한 검증 결과입니다 - 가설이 기각된 것이지 분석이 실패한 게 아닙니다.")
     print()
 
 
