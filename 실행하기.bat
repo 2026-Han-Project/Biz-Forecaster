@@ -84,7 +84,12 @@ echo [2/3] 필요한 라이브러리를 설치합니다... ^(인터넷 연결 필요^)
 echo       설치 진행 상황이 아래에 표시됩니다. 오래 걸려도 정상입니다.
 echo.
 "%VPY%" -m pip install --upgrade pip setuptools wheel
-"%VPY%" -m pip install -r requirements.txt
+rem   requirements-lock.txt 에 버전을 고정해 두었으므로 어느 PC에서나 같은 환경이 설치된다.
+if exist "requirements-lock.txt" (
+    "%VPY%" -m pip install -r requirements-lock.txt
+) else (
+    "%VPY%" -m pip install -r requirements.txt
+)
 if errorlevel 1 (
     echo.
     echo [오류] 라이브러리 설치에 실패했습니다.

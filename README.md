@@ -13,11 +13,14 @@ Python 탐색, 가상환경 생성, 라이브러리 설치, 앱 실행까지 한
 
 ```bash
 python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
 .venv\Scripts\python.exe -m streamlit run app.py
 ```
 
 - Python 3.11 권장. 3.13, 3.14에서는 prophet, xgboost 설치가 자주 실패함.
+- `requirements-lock.txt`에는 개발 PC에서 검증한 라이브러리 버전이 고정되어 있음. 이 파일로 설치하면 누구나 같은 환경을 만들 수 있음.
+- `requirements.txt`는 버전을 적지 않은 목록임. 라이브러리를 새로 추가했을 때는 여기에 이름을 적고, 설치 후 `pip freeze > requirements-lock.txt`로 버전 목록을 다시 만듦.
+- 실행 환경(`.venv`)은 용량이 크고 PC마다 경로가 달라 저장소에 올리지 않음.
 - 첫 화면에서 회원가입, 이메일 인증, 로그인 후 입력 파일을 업로드함.
 - 데이터가 없으면 사이드바의 "동봉된 예시 데이터로 둘러보기"를 체크하면 됨.
 - 입력 양식은 사이드바의 "입력 양식 내려받기"에서 받을 수 있음.
@@ -28,6 +31,7 @@ python -m venv .venv
 |---|---|
 | `app.py` | Streamlit 화면 (7개 탭, 마지막 탭은 개발자 전용) |
 | `실행하기.bat` | 원클릭 설치 및 실행 |
+| `requirements-lock.txt` | 라이브러리 버전 고정 목록 (실행 환경 재현용) |
 | `forecast/config.py` | 환경 변수(Config) 기본값 |
 | `forecast/inputs.py` | 입력 파일 5종 읽기 (한글 머리글, CP949 허용) |
 | `forecast/engine.py` | 수요예측 및 권장 생산량 계산 (6단계) |
