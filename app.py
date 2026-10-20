@@ -1,23 +1,24 @@
 import streamlit as st
 import pandas as pd
-import re
 import numpy as np
-from datetime import timedelta
-from typing import TypedDict, List
 import io
-import sqlite3
+import json
 from pathlib import Path
-from agent.brief_llm import generate_briefing
-from agent.mock_shap import get_contributions, format_contributions
 from agent.whatif_llm import parse_events_llm, stream_reply
 
-# --- 팀원 C 파트: 이상탐지(SPC 관리도) · 성능평가 모듈 ---
+# --- 수요예측 엔진: 매입 -> 역레시피 -> 진짜 수요 복원 -> 수준, 요일 학습 -> 시즌, 이벤트 -> 권장 생산량 ---
+# 구현체는 forecast/ 패키지(Streamlit 비의존). app.py 는 화면만 담당한다.
+from forecast import (
+    Config, WEEKDAY_NAMES, InputError, FILE_NAMES, load_inputs, fit, next_open_days,
+    cumulative_share,
+)
+
+# --- 팀원 C 파트: 이상탐지(SPC 관리도), 성능평가 모듈 ---
 from detect.control_charts import (
-    shewhart_3sigma, ewma_chart, cusum_chart, isolation_forest_flags,
-    run_all_detectors, residualize, weekday_residual,
+    shewhart_3sigma, ewma_chart, cusum_chart, weekday_residual,
 )
 # 탐지 결과를 '재고를 어떻게 하라'는 말로 옮기는 계층.
-# 통계 용어(3시그마·EWMA·CUSUM)는 화면에 나가지 않는다.
+# 통계 용어(3시그마, EWMA, CUSUM)는 화면에 나가지 않는다.
 from detect.alerts import build_alerts, build_context, trend_summary, weekday_guide
 
 # --- 계정 인증 (소상공인별 로그인) ---
@@ -30,33 +31,16 @@ from auth import store as auth_store
 import plotly.graph_objects as go
 import plotly.express as px
 
-# --- 통계/시계열 라이브러리 ---
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.stattools import grangercausalitytests
-
-# --- 머신러닝 라이브러리 (설치 여부 확인) ---
+# --- 머신러닝 라이브러리 (POS 판매데이터 탭: SHAP, H1, 설치 여부 확인) ---
 try:
-    from sklearn.ensemble import RandomForestRegressor, IsolationForest
+    from sklearn.ensemble import RandomForestRegressor
     from sklearn.linear_model import LinearRegression
-    import xgboost as xgb
 
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
 
-# --- 딥러닝 라이브러리 (설치 여부 확인) ---
-try:
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense
-    from sklearn.preprocessing import MinMaxScaler
-
-    TF_AVAILABLE = True
-except ImportError:
-    TF_AVAILABLE = False
-
-# --- Prophet 라이브러리 (Layer 1 기저모델, 설치 여부 확인) ---
+# --- Prophet 라이브러리 (H1 백테스트 기저모델, 설치 여부 확인) ---
 try:
     import logging as _logging
     from prophet import Prophet
@@ -67,29 +51,6 @@ try:
     PROPHET_AVAILABLE = True
 except ImportError:
     PROPHET_AVAILABLE = False
-
-# --- TFT(Temporal Fusion Transformer) 라이브러리 (Layer 1 고도화, 논문용 성능 비교, 설치 여부 확인) ---
-try:
-    import torch
-    import lightning.pytorch as pl
-    from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
-    from pytorch_forecasting.data import GroupNormalizer
-    from pytorch_forecasting.metrics import QuantileLoss
-
-    _logging.getLogger('pytorch_lightning').setLevel(_logging.WARNING)
-    _logging.getLogger('lightning').setLevel(_logging.WARNING)
-
-    TFT_AVAILABLE = True
-except ImportError:
-    TFT_AVAILABLE = False
-
-# --- LangGraph 에이전트 라이브러리 (설치 여부 확인) ---
-try:
-    from langgraph.graph import StateGraph, END
-
-    LANGGRAPH_AVAILABLE = True
-except ImportError:
-    LANGGRAPH_AVAILABLE = False
 
 # --- SHAP 라이브러리 (설치 여부 확인) ---
 try:
@@ -102,7 +63,7 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # 1. 페이지 설정
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="Biz Forecaster — 소상공인 AI 수요예측", layout="wide")
+st.set_page_config(page_title="Biz Forecaster - 소상공인 AI 수요예측", layout="wide")
 
 # -----------------------------------------------------------------------------
 # 1-1. 로그인 게이트
@@ -110,8 +71,9 @@ st.set_page_config(page_title="Biz Forecaster — 소상공인 AI 수요예측",
 # 소상공인마다 자기 매장 데이터만 보도록, 분석 화면 전체를 로그인 뒤로 숨긴다.
 # 미로그인 상태에서는 require_login()이 인증 화면을 그리고 None을 돌려주며,
 # st.stop()으로 아래 코드를 아예 실행하지 않는다 (데이터가 그려질 여지 자체를 없앤다).
-# 동봉된 예시 데이터셋. 데이터가 없어도 화면을 둘러볼 수 있게 한다.
-SAMPLE_DATA_PATH = Path(__file__).parent / "data" / "integrated_dataset.csv"
+# 동봉된 예시 데이터. 데이터가 없어도 화면을 둘러볼 수 있게 한다.
+SAMPLE_DATA_PATH = Path(__file__).parent / "data" / "integrated_dataset.csv"   # POS 판매데이터 탭용
+SAMPLE_INPUT_DIR = Path(__file__).parent / "data" / "sample"                   # 생산량 추천용 입력 5종
 
 CURRENT_USER = require_login()
 if CURRENT_USER is None:
@@ -125,20 +87,6 @@ if st.session_state.get(ACCOUNT_VIEW_KEY):
     st.stop()
 
 
-@st.cache_data
-def load_data(uploaded_file):
-    # 표준 통합 데이터셋(CSV) 로더: date/item/sales_qty를 Date/Item/Quantity로 매핑
-    df = pd.read_csv(uploaded_file, parse_dates=['date'])
-
-    # 같은 날짜·품목의 여러 시간대 행을 일 단위로 합산
-    daily = (
-        df.groupby(['date', 'item'], as_index=False)['sales_qty']
-        .sum()
-        .rename(columns={'date': 'Date', 'item': 'Item', 'sales_qty': 'Quantity'})
-    )
-    daily['Quantity'] = daily['Quantity'].astype(float)
-    return daily[['Item', 'Date', 'Quantity']]
-
 def to_excel(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -147,35 +95,8 @@ def to_excel(df):
 
 
 # -----------------------------------------------------------------------------
-# 2. 품목 등급 계산 함수
+# 2. 시계열 기저모델 (H1 백테스트 탭 전용)
 # -----------------------------------------------------------------------------
-def calculate_item_tiers(df):
-    # 품목별 총 판매량 집계
-    item_stats = df.groupby('Item')['Quantity'].sum().reset_index()
-    item_stats = item_stats.sort_values('Quantity', ascending=False)
-
-    # 순위 백분율 계산
-    item_stats['Rank_Pct'] = item_stats['Quantity'].rank(pct=True, ascending=False)
-
-    # 등급 부여
-    def get_tier(pct):
-        if pct <= 0.1:
-            return '💎 시그니처 메뉴 (상위 10%)'
-        elif pct <= 0.3:
-            return '🥇 인기 메뉴 (상위 30%)'
-        elif pct <= 0.6:
-            return '🥈 스테디셀러 (상위 60%)'
-        else:
-            return '🥉 일반 품목'
-
-    item_stats['Tier'] = item_stats['Rank_Pct'].apply(get_tier)
-    return item_stats[['Item', 'Tier', 'Quantity']]
-
-
-# -----------------------------------------------------------------------------
-# 3. 예측 모델 함수 (추세 반영 강화)
-# -----------------------------------------------------------------------------
-
 def predict_linear_trend_force(series, weeks=5):
     try:
         lookback = 8
@@ -193,73 +114,9 @@ def predict_linear_trend_force(series, weeks=5):
     except:
         return [series.mean()] * weeks
 
-
-def predict_holt_trend(series, weeks=5):
-    try:
-        if len(series) >= 4:
-            model = ExponentialSmoothing(
-                series, trend='add', seasonal=None, damped_trend=False
-            ).fit(optimized=True)
-            # statsmodels 버전에 따라 forecast()가 ndarray 또는 Series를 반환하므로
-            # np.asarray로 통일한다 (.values는 ndarray에 없어 AttributeError 발생 가능).
-            return np.asarray(model.forecast(weeks))
-        else:
-            return predict_linear_trend_force(series, weeks)
-    except Exception:
-        return predict_linear_trend_force(series, weeks)
-
-
-def predict_arima_trend(series, weeks=5):
-    try:
-        model = ARIMA(series, order=(1, 1, 1)).fit()
-        return np.asarray(model.forecast(steps=weeks))
-    except Exception:
-        return predict_linear_trend_force(series, weeks)
-
-
-def create_ml_dataset(series, window_size=4):
-    X, y = [], []
-    s_list = list(series)
-    for i in range(len(s_list) - window_size):
-        X.append(s_list[i: i + window_size])
-        y.append(s_list[i + window_size])
-    return np.array(X), np.array(y)
-
-
-def predict_ml_recursive(model, last_window, weeks=5):
-    preds = []
-    curr = list(last_window)
-    for _ in range(weeks):
-        in_row = np.array(curr[-len(last_window):]).reshape(1, -1)
-        pred = model.predict(in_row)[0]
-        preds.append(pred)
-        curr.append(pred)
-    return preds
-
-
-def predict_rf(series, weeks=5):
-    if not ML_AVAILABLE: return [0] * weeks
-    win = 4
-    if len(series) < win + 2: return predict_linear_trend_force(series, weeks)
-    X, y = create_ml_dataset(series, win)
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(X, y)
-    return predict_ml_recursive(model, series[-win:], weeks)
-
-
-def predict_xgboost(series, weeks=5):
-    if not ML_AVAILABLE: return [0] * weeks
-    win = 4
-    if len(series) < win + 2: return predict_linear_trend_force(series, weeks)
-    X, y = create_ml_dataset(series, win)
-    model = xgb.XGBRegressor(n_estimators=100, objective='reg:squarederror', random_state=42)
-    model.fit(X, y)
-    return predict_ml_recursive(model, series[-win:], weeks)
-
-
 def predict_prophet(dated_series, periods, freq='D'):
     """Layer 1 기저모델(Prophet). dated_series는 DatetimeIndex를 가진 pd.Series여야
-    실제 달력(연간·주간 계절성)을 학습할 수 있다. 실패·미설치·데이터 부족 시
+    실제 달력(연간, 주간 계절성)을 학습할 수 있다. 실패, 미설치, 데이터 부족 시
     predict_linear_trend_force로 폴백한다."""
     values = np.asarray(dated_series.values if hasattr(dated_series, 'values') else dated_series, dtype=float)
     if not PROPHET_AVAILABLE or len(values) < 10 or not hasattr(dated_series, 'index'):
@@ -283,19 +140,19 @@ def predict_prophet(dated_series, periods, freq='D'):
 
 
 def predict_prophet_with_events(train_series, train_events, test_events, freq='D'):
-    """Layer 2(H1) — 이벤트를 사후 곱셈 보정이 아니라 Prophet 회귀변수로
+    """Layer 2(H1) - 이벤트를 사후 곱셈 보정이 아니라 Prophet 회귀변수로
     기저모델 안에 직접 투입한다.
 
-    기존 곱셈형 게이팅 `ŷ_base×(1+Σβₖeₖ)`은 Prophet이 주간 계절성으로 이미
+    기존 곱셈형 게이팅 `y_hat_basex(1+sumbeta_ke_k)`은 Prophet이 주간 계절성으로 이미
     학습한 주말 효과를 다시 곱해 이벤트 효과를 **이중 계상**한다(실측상
-    β_weekend가 품목마다 +0.35~+0.43로 추정되어, 주말마다 예측치를 35~43%
-    추가 증폭시키고 있었다). `add_regressor()`로 넣으면 추세·계절성·이벤트가
+    beta_weekend가 품목마다 +0.35~+0.43로 추정되어, 주말마다 예측치를 35~43%
+    추가 증폭시키고 있었다). `add_regressor()`로 넣으면 추세, 계절성, 이벤트가
     한 번의 적합에서 동시에 분리 추정되므로 이 중복이 구조적으로 사라진다.
 
     실측(일별, 검증 14일, 4품목 평균 WAPE): 기저 31.7% / 곱셈형 게이팅 35.8%
     / 이벤트 회귀 22.5%.
 
-    미설치·데이터 부족·학습 실패 시 predict_prophet(이벤트 미반영)으로 폴백한다.
+    미설치, 데이터 부족, 학습 실패 시 predict_prophet(이벤트 미반영)으로 폴백한다.
     """
     periods = len(test_events)
     values = np.asarray(train_series.values if hasattr(train_series, 'values') else train_series,
@@ -325,231 +182,10 @@ def predict_prophet_with_events(train_series, train_events, test_events, freq='D
     except Exception:
         return predict_prophet(train_series, periods, freq=freq)
 
-
-def predict_tft(dated_series, periods, freq='D'):
-    """Layer 1 고도화 모델(TFT, Temporal Fusion Transformer) — 논문용 Prophet 대비
-    성능 비교 목적. 단일 품목 시계열에 대해 짧게 학습(few-epoch)한 뒤,
-    **관측 구간 이후의 미래 periods 구간**을 예측한다. 데이터가 부족
-    (encoder+prediction 구간 확보 불가)하거나 미설치·학습 실패 시
-    predict_prophet으로 폴백한다."""
-    values = np.asarray(dated_series.values if hasattr(dated_series, 'values') else dated_series, dtype=float)
-    n = len(values)
-    encoder_len = min(30, max(10, n - periods - 5))
-    if not TFT_AVAILABLE or n < encoder_len + periods + 5:
-        return predict_prophet(dated_series, periods, freq=freq)
-    try:
-        torch.manual_seed(42)
-        df = pd.DataFrame({
-            'time_idx': np.arange(n),
-            'group': 'series',
-            'value': values,
-        })
-
-        # 학습은 관측된 전체 이력(0 ~ n-1)을 사용한다. 예측 대상이 '미래'이므로
-        # 가장 최근 구간을 학습에서 떼어놓을 이유가 없다.
-        training = TimeSeriesDataSet(
-            df,
-            time_idx='time_idx',
-            target='value',
-            group_ids=['group'],
-            min_encoder_length=max(1, encoder_len // 2),
-            max_encoder_length=encoder_len,
-            min_prediction_length=1,
-            max_prediction_length=periods,
-            time_varying_unknown_reals=['value'],
-            target_normalizer=GroupNormalizer(groups=['group']),
-            add_relative_time_idx=True,
-            add_target_scales=True,
-            add_encoder_length=True,
-        )
-        train_dataloader = training.to_dataloader(train=True, batch_size=16, num_workers=0)
-
-        tft = TemporalFusionTransformer.from_dataset(
-            training,
-            learning_rate=0.03,
-            hidden_size=8,
-            attention_head_size=1,
-            dropout=0.1,
-            hidden_continuous_size=8,
-            loss=QuantileLoss(),
-            optimizer='adam',
-            log_interval=-1,
-        )
-
-        trainer = pl.Trainer(
-            max_epochs=8,
-            accelerator='cpu',
-            enable_progress_bar=False,
-            enable_model_summary=False,
-            logger=False,
-            enable_checkpointing=False,
-        )
-        trainer.fit(tft, train_dataloaders=train_dataloader)
-
-        # --- 미래 구간 예측 ---
-        # TimeSeriesDataSet(predict=True)는 '넘겨준 데이터프레임의 마지막 예측창'을 고른다.
-        # 관측 데이터만 넘기면 디코더가 과거 마지막 periods 구간을 가리키므로(=예측이 아니라 재현),
-        # 인코더(관측 마지막 encoder_len) + 디코더(아직 관측되지 않은 미래 periods) 프레임을
-        # 직접 만들어 넘긴다. 미래 행의 'value'는 타깃이라 모델 입력으로 쓰이지 않으며,
-        # 데이터셋 구성을 위한 자리표시자로 마지막 관측값을 복사해 둔다.
-        last_idx = int(df['time_idx'].iloc[-1])
-        encoder_df = df[df['time_idx'] > last_idx - encoder_len]
-        future_df = pd.concat(
-            [df.iloc[[-1]].assign(time_idx=last_idx + i) for i in range(1, periods + 1)],
-            ignore_index=True,
-        )
-        predict_df = pd.concat([encoder_df, future_df], ignore_index=True)
-
-        predict_ds = TimeSeriesDataSet.from_dataset(
-            training, predict_df, predict=True, stop_randomization=True
-        )
-        predict_dl = predict_ds.to_dataloader(train=False, batch_size=1, num_workers=0)
-
-        raw_predictions = tft.predict(predict_dl, mode='prediction')
-        forecast = np.asarray(raw_predictions[0]).flatten()[:periods]
-        if len(forecast) < periods:
-            return predict_prophet(dated_series, periods, freq=freq)
-        return forecast
-    except Exception:
-        return predict_prophet(dated_series, periods, freq=freq)
-
-
-def predict_lstm(series, weeks=5):
-    if not TF_AVAILABLE: return [0] * weeks
-    win = 4
-    if len(series) < win + 5: return predict_linear_trend_force(series, weeks)
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    s_scaled = scaler.fit_transform(np.array(series).reshape(-1, 1))
-    X, y = [], []
-    for i in range(len(s_scaled) - win):
-        X.append(s_scaled[i: i + win])
-        y.append(s_scaled[i + win])
-    X, y = np.array(X), np.array(y)
-
-    model = Sequential()
-    model.add(LSTM(50, activation='relu', input_shape=(win, 1)))
-    model.add(Dense(1))
-    model.compile(optimizer='adam', loss='mse')
-    model.fit(X, y, epochs=30, verbose=0, batch_size=2)
-
-    preds = []
-    curr = s_scaled[-win:]
-    for _ in range(weeks):
-        pred_sc = model.predict(curr.reshape(1, win, 1), verbose=0)[0][0]
-        preds.append(pred_sc)
-        curr = np.append(curr[1:], [[pred_sc]], axis=0)
-    return scaler.inverse_transform(np.array(preds).reshape(-1, 1)).flatten()
-
-
 # -----------------------------------------------------------------------------
-# 4. LangGraph 에이전트 (조회 → 예측 → 해석 → 브리핑)
+# 5. 이벤트 우선 게이팅 (Layer 2, H1) - 통합 이벤트 데이터셋 기반 Walk-forward 백테스트
 # -----------------------------------------------------------------------------
-# ※ Layer 2(이벤트 게이팅)·Layer 3(품목간 수요연쇄)·SHAP 기여도 분해는 아직 로드맵 개발 중이라
-#   이 에이전트의 '해석' 단계는 현재 계산된 예측치의 통계(최근 평균 대비 변화율)만 근거로 사용한다.
-#   이벤트·품목연쇄 파이프라인이 붙으면 _interpret_node 안에서 해당 기여도를 추가로 반영하면 된다.
-
-class ForecastBriefState(TypedDict):
-    item: str
-    tier: str
-    history: List[float]
-    forecast: List[float]
-    dates: List[str]
-    recent_avg: float
-    next_avg: float
-    pct_change: float
-    trend: str
-    peak_week: str
-    briefing: str
-    shap_top: str
-
-
-def _retrieve_node(state: ForecastBriefState) -> dict:
-    """조회: 최근 8주 판매 이력만 추려 다음 단계로 전달."""
-    history = state["history"]
-    recent_history = history[-8:] if len(history) >= 8 else history
-    return {"history": recent_history}
-
-
-def _predict_node(state: ForecastBriefState) -> dict:
-    """예측: Streamlit에서 이미 계산된 앙상블 예측치를 그대로 통과시킨다."""
-    return {}
-
-
-def _interpret_node(state: ForecastBriefState) -> dict:
-    """해석: 최근 평균 대비 예측 평균의 변화율로 트렌드를 규정 (SHAP 기여도 분해의 임시 근사)."""
-    history = state["history"]
-    forecast = state["forecast"]
-    recent_avg = float(np.mean(history)) if history else 0.0
-    next_avg = float(np.mean(forecast)) if forecast else 0.0
-    pct_change = ((next_avg - recent_avg) / recent_avg * 100) if recent_avg > 0 else 0.0
-
-    if pct_change >= 10:
-        trend = "증가"
-    elif pct_change <= -10:
-        trend = "감소"
-    else:
-        trend = "보합"
-
-    peak_idx = int(np.argmax(forecast)) if forecast else 0
-    peak_week = state["dates"][peak_idx] if state.get("dates") else ""
-
-    return {
-        "recent_avg": round(recent_avg, 1),
-        "next_avg": round(next_avg, 1),
-        "pct_change": round(pct_change, 1),
-        "trend": trend,
-        "peak_week": peak_week,
-        "shap_top": format_contributions(get_contributions(state["item"])),
-    }
-
-
-def _brief_node(state: ForecastBriefState) -> dict:
-    """브리핑: 해석 결과를 자연어 문장으로 변환 (LLM 미연결 상태의 템플릿 기반 생성)."""
-    trend_phrase = {
-        "증가": f"최근 평균 대비 {abs(state['pct_change'])}% 증가가 예상됩니다.",
-        "감소": f"최근 평균 대비 {abs(state['pct_change'])}% 감소가 예상됩니다.",
-        "보합": "최근 평균과 비슷한 수준을 유지할 것으로 예상됩니다.",
-    }[state["trend"]]
-
-    action_phrase = {
-        "증가": "결품을 막기 위해 생산량을 여유 있게 준비하는 것을 권장합니다.",
-        "감소": "과다생산·폐기를 줄이기 위해 생산량을 보수적으로 조정하는 것을 권장합니다.",
-        "보합": "평소 생산 계획을 유지해도 무방합니다.",
-    }[state["trend"]]
-
-    briefing = (
-        f"'{state['item']}'({state['tier']})은 향후 5주 평균 약 {state['next_avg']}개 판매가 예상되며, "
-        f"{trend_phrase} 특히 {state['peak_week']} 주간에 가장 높은 수요가 예상됩니다. {action_phrase}\n\n"
-        "※ 본 브리핑은 시계열 기저 예측(Layer 1) 통계 기준이며, 이벤트 우선 게이팅(H1)·품목간 수요연쇄(H2′)·"
-        "SHAP 기여도 분해는 로드맵 개발 중으로 아직 반영되지 않았습니다."
-    )
-    llm_text=generate_briefing(state)
-    if llm_text:
-        briefing=llm_text
-    return {"briefing": briefing}
-
-
-@st.cache_resource
-def build_briefing_agent():
-    graph = StateGraph(ForecastBriefState)
-    graph.add_node("retrieve", _retrieve_node)
-    graph.add_node("predict", _predict_node)
-    graph.add_node("interpret", _interpret_node)
-    graph.add_node("brief", _brief_node)
-
-    graph.set_entry_point("retrieve")
-    graph.add_edge("retrieve", "predict")
-    graph.add_edge("predict", "interpret")
-    graph.add_edge("interpret", "brief")
-    graph.add_edge("brief", END)
-
-    return graph.compile()
-
-
-# -----------------------------------------------------------------------------
-# 5. 이벤트 우선 게이팅 (Layer 2, H1) — 통합 이벤트 데이터셋 기반 Walk-forward 백테스트
-# -----------------------------------------------------------------------------
-# 데이터셋의 미래(예: 다음 5주)의 실제 공휴일·날씨는 알 수 없으므로, '미래 예측'이 아니라
+# 데이터셋의 미래(예: 다음 5주)의 실제 공휴일, 날씨는 알 수 없으므로, '미래 예측'이 아니라
 # 최근 N일을 떼어내 실제값과 비교하는 백테스트로 H1(이벤트 우선 예측이 기저 예측보다 정확한가)을 검증한다.
 
 @st.cache_data
@@ -558,7 +194,7 @@ def load_event_dataset(uploaded_file):
 
 
 def build_event_dummies(daily):
-    """일별 이벤트 플래그(요일·공휴일·방학·시즌·날씨)를 0/1 더미로 변환."""
+    """일별 이벤트 플래그(요일, 공휴일, 방학, 시즌, 날씨)를 0/1 더미로 변환."""
     e = pd.DataFrame(index=daily.index)
     e['is_weekend'] = daily['is_weekend'].astype(float)
     e['is_holiday'] = daily['is_holiday'].astype(float)
@@ -573,10 +209,10 @@ def build_event_dummies(daily):
 
 
 def fit_event_elasticity(qty, events):
-    """이벤트별 수요 탄력도(β_k)를 추정한다.
+    """이벤트별 수요 탄력도(beta_k)를 추정한다.
 
     국소 기저치(14일 중심 이동중앙값) 대비 실제값의 상대 편차를 이벤트 더미에 회귀시켜,
-    'ŷ_final = ŷ_base × (1 + Σ βₖ·eₖ)' 융합식의 βₖ를 구한다.
+    'y_hat_final = y_hat_base x (1 + sum beta_k, e_k)' 융합식의 beta_k를 구한다.
     """
     baseline = qty.rolling(14, center=True, min_periods=7).median()
     baseline = baseline.bfill().ffill()
@@ -589,7 +225,7 @@ def fit_event_elasticity(qty, events):
 
 
 def apply_event_gating(base_forecast, beta, test_events, tau):
-    """이벤트 강도 점수가 임계치 τ를 넘는 날에만 이벤트 조정치를 예측에 반영(게이팅)."""
+    """이벤트 강도 점수가 임계치 tau를 넘는 날에만 이벤트 조정치를 예측에 반영(게이팅)."""
     cols = list(test_events.columns)
     event_score = test_events.values @ np.array([beta[c] for c in cols])
     gate_on = np.abs(event_score) >= tau
@@ -608,39 +244,39 @@ def compute_wape(actual, pred):
 
 
 # -----------------------------------------------------------------------------
-# 7. 실시간 이상탐지 — SPC 관리도 3종 + Isolation Forest
+# 7. 실시간 이상탐지 - SPC 관리도 3종 + Isolation Forest
 # -----------------------------------------------------------------------------
 # 구현체는 detect/ 패키지로 분리했다(detect/control_charts.py, detect/evaluation.py).
 # app.py는 화면만 담당하고, 탐지 로직은 UI 없이 단독으로 테스트할 수 있게 떼어낸 것이다.
 #
 # 팀원 C 파트에서 이번에 보강한 것
-#   - CUSUM 관리도 추가 (기존에는 3시그마·EWMA뿐이라 점진적 드리프트를 놓치고 있었다)
+#   - CUSUM 관리도 추가 (기존에는 3시그마, EWMA뿐이라 점진적 드리프트를 놓치고 있었다)
 #   - 요일 계절성을 제거한 잔차 관리도 옵션 (SPC의 정상상태 가정을 맞춰준다)
 #   - 오탐/미탐 트레이드오프 정량화 (detect/evaluation.py, 탭 8)
 #
 # 아래 세 함수는 기존 호출부와의 호환을 위해 남겨둔 얇은 래퍼다.
 
 def rolling_3sigma_flags(series, window=28, min_periods=10, L=3.0, non_negative=True):
-    """3시그마(Shewhart) 관리도 — detect.control_charts.shewhart_3sigma 래퍼."""
+    """3시그마(Shewhart) 관리도 - detect.control_charts.shewhart_3sigma 래퍼."""
     return shewhart_3sigma(series, L=L, window=window,
                             min_periods=min_periods, non_negative=non_negative)
 
 
 def ewma_flags(series, lam=0.2, L=3, window=28, min_periods=10, non_negative=True):
-    """EWMA 관리도 — detect.control_charts.ewma_chart 래퍼."""
+    """EWMA 관리도 - detect.control_charts.ewma_chart 래퍼."""
     return ewma_chart(series, lam=lam, L=L, window=window,
                        min_periods=min_periods, non_negative=non_negative)
 
 
 def cusum_flags(series, k=0.5, h=5.0, window=28, min_periods=10):
-    """CUSUM 관리도 — detect.control_charts.cusum_chart 래퍼 (이번에 새로 추가)."""
+    """CUSUM 관리도 - detect.control_charts.cusum_chart 래퍼 (이번에 새로 추가)."""
     return cusum_chart(series, k=k, h=h, window=window, min_periods=min_periods)
 
 
 # -----------------------------------------------------------------------------
 # 8. SHAP 기여도 분석 (XAI)
 # -----------------------------------------------------------------------------
-# build_event_dummies()로 만든 이벤트 피처에 기온·추세를 더해 RandomForest로 학습하고,
+# build_event_dummies()로 만든 이벤트 피처에 기온, 추세를 더해 RandomForest로 학습하고,
 # SHAP TreeExplainer로 각 예측을 '기저치 + 이벤트별 기여도'로 분해한다.
 # 여기서 나오는 (피처, 기여도) 쌍은 LangGraph 에이전트(_interpret_node)의 해석 단계에
 # 그대로 연결할 수 있도록 설계했다.
@@ -690,987 +326,1050 @@ def format_shap_briefing(item, date, base_value, contribs, pred, actual, top_n=5
         f"기저치 {base_value:.1f}개에 {detail}가 더해진 값입니다."
     )
 
-
 # -----------------------------------------------------------------------------
-# 10. What-if 채팅 (D팀) — 키워드 기반 시나리오 파싱 + H1 게이팅 모델로 실계산
+# 9. 생산량 추천 - 입력 파일, 환경 변수, 화면
 # -----------------------------------------------------------------------------
-# 실제 LLM API 키가 연결돼 있지 않아, 자연어 이해는 키워드 매칭으로 단순화했다.
-# 대신 응답에 쓰이는 예측치·권장 생산량은 build_event_dummies/fit_event_elasticity로
-# 학습한 실제 H1 모델에서 계산한 값이다 (지어낸 숫자가 아님).
+# 예측 계산은 forecast/ 패키지가 한다. 여기서는 입력을 모으고 결과를 사장님 말로 옮긴다.
 
-WHATIF_KEYWORD_MAP = {
-    'is_rain': ['비', '우천', '강수'],
-    'is_snow': ['눈', '폭설'],
-    'is_holiday': ['공휴일', '연휴', '휴일'],
-    'is_vacation': ['방학'],
-    'is_weekend': ['주말', '토요일', '일요일'],
-    'is_christmas': ['크리스마스', '성탄'],
-    'is_suneung': ['수능'],
-    'is_valentine': ['밸런타인', '발렌타인'],
-    'is_chuseok': ['추석'],
+INPUT_HELP = {
+    'products': "제품명, 판매가, 원가, 회수가, 평소 생산량 - 1회 입력. "
+                "회수가 = 다음 날 할인가 등, 없으면 0",
+    'recipe': "제품, 재료, 1개당 재료량 - 1회 입력. 핵심 재료 2~5개면 충분",
+    'purchases': "날짜, 재료, 수량 - 과거분 일괄. 장부, 거래명세서에서 그대로 옮기면 됨",
+    'daily_log': "날짜, 제품, 결과, (생산량) - 매일 마감 시. "
+                 "결과: 3 = 3개 남음, 15:30 = 15시 30분 품절, 0 = 마감 무렵 다 팔림, "
+                 "빈칸 = 입력 안 함. 생산량은 평소와 다를 때만 입력",
+    'events': "날짜, 태그(holiday, rain, event) - 선택",
 }
+TAG_LABELS = {'holiday': '공휴일', 'rain': '비', 'event': '행사'}
+WHATIF_KEYWORDS = {
+    'holiday': ['공휴일', '연휴', '휴일', '명절', '빨간날', '추석', '설날'],
+    'rain': ['비 오', '비가', '비오', '우천', '장마', '강수'],
+    'event': ['행사', '축제', '이벤트', '크리스마스', '밸런타인', '발렌타인', '수능'],
+}
+CONFIG_FILE = 'config.json'
 
 
-def whatif_compute(beta, base_forecast, events, tau):
-    """이벤트 조건을 반영한 예상 판매량을 계산한다.
-
-    ŷ_final = ŷ_base x (1 + Σ βₖ·eₖ)  단, |Σ βₖ·eₖ| >= τ 일 때만 반영(게이팅).
-
-    게이팅을 두는 이유는 약한 이벤트까지 매번 예측을 흔들면 오히려 정확도가 떨어지기
-    때문이다. 다만 이 때문에 "비를 체크했는데 숫자가 그대로"인 상황이 생기므로,
-    화면에서는 이벤트별 기여도와 미발동 사유를 함께 보여줘야 한다.
-    """
-    contribs = {k: beta.get(k, 0.0) for k, v in events.items() if v}
-    score = sum(beta.get(k, 0.0) * v for k, v in events.items())
-    gate_on = abs(score) >= tau
-    final = float(np.clip(base_forecast * (1 + score) if gate_on else base_forecast, 0, None))
-    return {
-        'score': score,
-        'gate_on': gate_on,
-        'final': final,
-        'production': int(np.ceil(final * 1.1)),
-        'pct': (final - base_forecast) / base_forecast * 100 if base_forecast > 0 else 0.0,
-        'contribs': contribs,
-    }
+def tag_label(tag):
+    return TAG_LABELS.get(tag, tag)
 
 
-def whatif_reply_text(item, cond_str, base_forecast, r, tau):
-    """계산 결과를 한 문단 답변으로 만든다 (LLM 미연동 시 사용하는 기본 답변)."""
-    reply = (
-        f"조건({cond_str})을 반영하면 '{item}' 예상 판매량은 "
-        f"{base_forecast:.0f}개 → **{r['final']:.0f}개** ({r['pct']:+.1f}%)입니다. "
-        f"안전재고 10%를 더한 권장 생산량은 **{r['production']}개**입니다."
-    )
-    if not r['gate_on']:
-        reply += (
-            f" (이벤트 강도 {r['score']:+.2f}가 임계치 τ={tau:.2f}보다 작아 게이팅이 발동하지 않았고, "
-            f"기저 예측을 그대로 유지했습니다. τ를 낮추면 반영됩니다.)"
+@st.cache_resource(show_spinner=False, max_entries=8)
+def build_model(blobs, cfg_json):
+    """입력 파일(바이트)과 설정이 같으면 다시 학습하지 않는다."""
+    inputs = load_inputs({k: io.BytesIO(b) for k, b in blobs})
+    return fit(inputs, Config.from_dict(json.loads(cfg_json)))
+
+
+def render_config_editor(base: Config, user_dir: Path) -> Config:
+    """환경 변수 표를 그대로 화면에 옮긴 편집기. 바꾼 값은 즉시 예측에 반영된다."""
+    st.subheader("환경 변수 (Config)")
+    st.caption("바꾸면 다른 탭의 예측이 바로 다시 계산됩니다. 매장에 맞는 값을 찾았으면 **저장**하세요.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**영업**")
+        open_hour = st.number_input("open_hour - 영업 시작(시)", 0, 23, base.open_hour, key='cfg_open')
+        close_hour = st.number_input("close_hour - 영업 마감(시)", 1, 24, base.close_hour, key='cfg_close')
+        closed = st.multiselect("closed_weekdays - 정기 휴무 요일", WEEKDAY_NAMES,
+                                [WEEKDAY_NAMES[d] for d in base.closed_weekdays], key='cfg_closed')
+        st.markdown("**학습 속도**")
+        alpha = st.slider("alpha - 최근 변화 반응 속도", 0.05, 0.8, float(base.alpha), 0.05, key='cfg_alpha',
+                          help="높이면 최근 변화에 빨리 반응합니다 (대신 노이즈도 커짐)")
+        k_cred = st.number_input("k_cred - 관측을 믿기까지 필요한 입력 일수", 0.0, 60.0,
+                                 float(base.k_cred), 1.0, key='cfg_kcred',
+                                 help="낮을수록 사전값에서 관측으로 빨리 전환합니다. k=5면 5일에 50:50, 20일에 관측 80%")
+        k_weekday = st.number_input("k_weekday - 요일 계수 보수성", 0.0, 60.0,
+                                    float(base.k_weekday), 1.0, key='cfg_kwd',
+                                    help="요일 편차가 과해 보이면 높이세요")
+    with c2:
+        st.markdown("**품절 보정**")
+        max_uplift = st.number_input("max_uplift - 품절 보정 상한(배)", 1.0, 5.0,
+                                     float(base.max_uplift), 0.1, key='cfg_maxup')
+        close_uplift = st.number_input("close_uplift - 마감 직전 품절 시 보정(배)", 1.0, 2.0,
+                                       float(base.close_uplift), 0.01, key='cfg_closeup')
+        st.markdown("**역레시피, 사전값**")
+        loss_rate = st.number_input("loss_rate - 재료 로스(반죽 손실, 실패, 시식)", 0.0, 0.5,
+                                    float(base.loss_rate), 0.01, key='cfg_loss')
+        prior_waste = st.number_input("prior_waste - 초기 단계 안 팔린 비율 가정", 0.0, 0.6,
+                                      float(base.prior_waste), 0.01, key='cfg_pwaste')
+        bom_window_days = st.number_input("bom_window_days - 역레시피 계산 기간(일)", 7, 120,
+                                          int(base.bom_window_days), 7, key='cfg_bomwin')
+        bom_lambda = st.number_input("bom_lambda - 평소 생산 구성비를 믿는 정도", 0.0, 10.0,
+                                     float(base.bom_lambda), 0.1, key='cfg_bomlam')
+    with c3:
+        st.markdown("**권장 생산량**")
+        default_cv = st.number_input("default_cv - 데이터 부족 시 수요 변동계수", 0.05, 1.0,
+                                     float(base.default_cv), 0.05, key='cfg_cv')
+        sl_bounds = st.slider("sl_bounds - 목표 서비스수준 범위", 0.30, 0.99,
+                              tuple(base.sl_bounds), 0.01, key='cfg_sl')
+        st.markdown("**시즌, 이벤트**")
+        season_bounds = st.slider("season_bounds - 시즌 보정 하한, 상한", 0.5, 2.0,
+                                  tuple(base.season_bounds), 0.05, key='cfg_season')
+        ev_df = st.data_editor(
+            pd.DataFrame({'태그': list(base.event_factors), '배수': list(base.event_factors.values())}),
+            num_rows='dynamic', hide_index=True, width='stretch', key='cfg_events',
+            column_config={'배수': st.column_config.NumberColumn(min_value=0.1, max_value=5.0, step=0.05)},
         )
-    return reply
+        st.caption("event_factors - events.csv 의 태그별 배수 (holiday 공휴일, rain 비, event 행사)")
+
+    p1, p2 = st.columns([1.6, 1])
+    with p1:
+        st.markdown("**hourly_profile - 시간대별 판매 비중** (품절 보정 강도를 결정하므로 매장에 맞게 조정)")
+        hours = list(range(int(open_hour), int(close_hour)))
+        prof_df = pd.DataFrame([[base.hourly_profile.get(h, 0.0) for h in hours]],
+                               columns=[f"{h}시" for h in hours])
+        prof_df = st.data_editor(prof_df, hide_index=True, width='stretch',
+                                 key=f'cfg_profile_{open_hour}_{close_hour}')
+    with p2:
+        st.markdown("**weekday_prior - 사장님의 요일 감각** (예: 토요일 1.2)")
+        wd_df = st.data_editor(pd.DataFrame([base.weekday_prior], columns=WEEKDAY_NAMES),
+                               hide_index=True, width='stretch', key='cfg_wdprior')
+
+    cfg = Config(
+        open_hour=int(open_hour), close_hour=int(close_hour),
+        closed_weekdays=[WEEKDAY_NAMES.index(d) for d in closed],
+        hourly_profile={h: float(v) if pd.notna(v) else 0.0
+                        for h, v in zip(hours, prof_df.iloc[0])},
+        weekday_prior=[float(v) if pd.notna(v) else 0.0 for v in wd_df.iloc[0]],
+        alpha=float(alpha), k_cred=float(k_cred), k_weekday=float(k_weekday),
+        max_uplift=float(max_uplift), close_uplift=float(close_uplift),
+        loss_rate=float(loss_rate), prior_waste=float(prior_waste),
+        bom_window_days=int(bom_window_days), bom_lambda=float(bom_lambda),
+        default_cv=float(default_cv), sl_bounds=sl_bounds,
+        event_factors={str(t).strip().lower(): float(f) for t, f in zip(ev_df['태그'], ev_df['배수'])
+                       if str(t).strip() and t is not None and pd.notna(f)},
+        season_bounds=season_bounds,
+    )
+    errs = cfg.validate()
+    for e in errs:
+        st.error(e)
+
+    b1, b2, _ = st.columns([1, 1, 3])
+    if b1.button("이 설정 저장", disabled=bool(errs)):
+        cfg.save(user_dir / CONFIG_FILE)
+        st.session_state.cfg_base = cfg.to_dict()
+        st.success("저장했습니다. 다음 로그인 때도 이 설정으로 계산합니다.")
+    if b2.button("기본값으로"):
+        for k in [k for k in st.session_state if str(k).startswith('cfg_') and k != 'cfg_base']:
+            del st.session_state[k]
+        st.session_state.cfg_base = Config().to_dict()
+        st.rerun()
+
+    return base if errs else cfg
 
 
-def parse_whatif_keywords(text):
-    """채팅 문구에서 이벤트 키워드를 인식해 0/1 플래그로 변환 (단순 키워드 매칭, NLU 아님)."""
-    flags = {k: False for k in WHATIF_KEYWORD_MAP}
-    for key, kws in WHATIF_KEYWORD_MAP.items():
-        if any(kw in text for kw in kws):
-            flags[key] = True
-    return flags
+def explain_prediction(model, r):
+    """예측 1건을 사장님이 읽는 두세 문장으로."""
+    prod = model.inputs.products.loc[r['product']]
+    lv = model.levels.loc[r['product']]
+    when = f"{r['date'].month}월 {r['date'].day}일({r['weekday']})"
+    lines = [f"{when} '{r['product']}'은 약 **{r['mu']:.0f}개** 팔릴 것으로 보입니다."]
 
+    why = []
+    if abs(r['weekday_coef'] - 1) >= 0.05:
+        why.append(f"{r['weekday']}요일은 평소의 {r['weekday_coef']:.0%} 수준")
+    if abs(r['season'] - 1) >= 0.03:
+        why.append(f"작년 이맘때 생산 흐름 기준 시즌 보정 {r['season']:.2f}배")
+    if r['tags']:
+        why.append(f"{', '.join(tag_label(t) for t in r['tags'])} 배수 {r['event']:.2f}")
+    if why:
+        lines.append("반영한 것: " + ", ".join(why) + ".")
 
-# -----------------------------------------------------------------------------
-# 3. 메인 UI 구성
-# -----------------------------------------------------------------------------
-st.title(f"🥐 {CURRENT_USER['shop_name']} — AI 수요 예측")
-st.write("판매 활성도(기간)와 판매 규모(베스트셀러 등급) 필터를 활용하여 원하는 품목을 쉽게 찾으세요.")
-
-# --- 사용자별 데이터 업로드 ---
-# 업로드한 파일은 계정별로 분리된 data/users/<user_id>/ 아래에만 저장된다.
-# 다음 접속 때 다시 올릴 필요 없이 이전 파일을 그대로 불러올 수 있다.
-with st.sidebar:
-    st.header("📂 1. 파일 업로드")
-    uploaded_file = st.file_uploader("판매내역 CSV 파일을 선택하세요", type=['csv'])
-
-    if uploaded_file is not None:
-        try:
-            saved_path = auth_store.user_data_dir(CURRENT_USER['id']) / uploaded_file.name
-            raw_bytes = uploaded_file.getvalue()
-            saved_path.write_bytes(raw_bytes)
-            auth_store.record_dataset(
-                CURRENT_USER['id'], uploaded_file.name, saved_path,
-                n_rows=max(len(raw_bytes.splitlines()) - 1, 0),
-            )
-            uploaded_file.seek(0)   # 저장하며 소비한 스트림을 되감아야 아래 로더가 읽는다
-        except Exception as e:
-            st.warning(f"파일 보관에 실패했습니다(분석은 그대로 진행됩니다): {e}")
-
-    if uploaded_file is None and SAMPLE_DATA_PATH.exists():
-        if st.checkbox("동봉된 예시 데이터로 둘러보기", key='main_sample'):
-            uploaded_file = str(SAMPLE_DATA_PATH)
-
-    my_datasets = auth_store.list_datasets(CURRENT_USER['id'])
-    if uploaded_file is None and my_datasets:
-        st.caption("이전에 올린 파일 다시 사용하기")
-        options = {
-            f"{d['filename']}  ({d['uploaded_at'][:16]})": d['stored_path']
-            for d in my_datasets
-        }
-        picked = st.selectbox("내 데이터", ["(선택 안 함)"] + list(options.keys()),
-                               label_visibility='collapsed')
-        if picked != "(선택 안 함)":
-            chosen = Path(options[picked])
-            if chosen.exists():
-                uploaded_file = str(chosen)
-            else:
-                st.warning("저장된 파일을 찾을 수 없습니다. 다시 업로드해주세요.")
-
-if uploaded_file is not None:
-    df = load_data(uploaded_file)
-    if df.empty:
-        st.error("데이터 로드 실패")
+    sl = r['service_level']
+    if sl >= 0.9:
+        style = (f"남아도 손해가 적은 품목이라(회수가 {prod['salvage']:,.0f}원) 넉넉하게 - "
+                 f"품절이 나지 않을 확률 {sl:.0%}")
+    elif sl <= 0.7:
+        style = f"버리면 손해가 큰 품목이라 빠듯하게 - 품절이 나지 않을 확률 {sl:.0%}"
     else:
-        max_date = df['Date'].max()
+        style = f"품절이 나지 않을 확률 {sl:.0%}"
+    lines.append(f"{style}를 목표로 **{r['production']}개**를 권합니다.")
 
-        # [전처리] 품목 등급 산출
-        tier_df = calculate_item_tiers(df)
-        # 등급 정보를 메인 데이터프레임과 병합할 수도 있지만, 필터링용 리스트로 활용
+    if lv['n_obs'] < model.cfg.k_cred * 4:
+        lines.append(f"아직 마감 기록이 {int(lv['n_obs'])}일치라, 매입장부로 추정한 사전값을 "
+                     f"{1 - lv['weight']:.0%} 섞었습니다.")
+    return " ".join(lines)
 
-        st.sidebar.success(f"로드 완료! ({len(df):,}건)")
 
-        tab_detail, tab_top, tab_alert, tab_shap, tab_whatif, tab_h1 = st.tabs([
-            "📊 품목별 상세 분석 (Ensemble)", "🏆 베스트셀러 TOP N",
-            "📦 판매 이상 알림", "🧮 SHAP 기여도", "💬 What-if 채팅",
-            "🌦 이벤트 우선 예측 (H1)"
-        ])
+def prediction_chain(model, r):
+    """사전값, 학습 수준, 요일, 시즌, 이벤트, 권장 생산량 순서의 단계별 숫자."""
+    lv = model.levels.loc[r['product']]
+    cfg = model.cfg
+    rows = [
+        ("2. 역레시피 생산 추정", f"{lv['prior_production']:.1f}개/일",
+         f"{model.bom.method} ({cfg.bom_window_days}일)"),
+        ("2. 사전값", f"{lv['prior']:.1f}개", f"생산량 곱하기 (1 - prior_waste {cfg.prior_waste:.0%})"),
+        ("4. 관측 수준 (EWMA)", "없음" if pd.isna(lv['ewma']) else f"{lv['ewma']:.1f}개",
+         f"마감 기록 {int(lv['n_obs'])}일 (품절 복원 {int(lv['n_censored'])}일), alpha {cfg.alpha}"),
+        ("4. 학습 수준", f"{lv['level']:.1f}개",
+         f"관측 {lv['weight']:.0%}, 사전값 {1 - lv['weight']:.0%} 비율로 섞음 (n/(n+k), k={cfg.k_cred:g})"),
+        ("4. 요일 계수", f"{r['weekday_coef']:.2f}배", f"{r['weekday']}요일"),
+        ("5. 시즌 보정", f"{r['season']:.2f}배",
+         "작년 같은 시기 매입 흐름" if model.season_enabled else "매입 이력 1년 미만이라 미적용"),
+        ("5. 이벤트 배수", f"{r['event']:.2f}배",
+         ", ".join(tag_label(t) for t in r['tags']) or "없음"),
+        ("5. 예상 판매량", f"{r['mu']:.1f}개", "학습 수준에 위 계수를 모두 곱한 값"),
+        ("6. 목표 서비스수준", f"{r['service_level']:.0%}",
+         f"(판매가 - 원가) / (판매가 - 회수가), {cfg.sl_bounds[0]:.0%}~{cfg.sl_bounds[1]:.0%} 범위로 제한"),
+        ("6. 권장 생산량", f"{r['production']}개",
+         f"예상 판매량에 여유분 추가 (z {r['z']:.2f}, 변동계수 {r['cv']:.2f})"),
+    ]
+    return pd.DataFrame(rows, columns=['단계', '값', '근거'])
 
-        # 탭 1: 품목별 상세 분석
-        with tab_detail:
-            st.subheader("품목 정밀 분석 및 필터링")
 
-            # --- [필터 섹션] ---
-            with st.expander("🔎 품목 필터 옵션 (클릭하여 펼치기)", expanded=True):
-                f_col1, f_col2 = st.columns(2)
+def render_input_guide():
+    st.info("왼쪽 사이드바에서 입력 파일을 올리거나 **동봉된 예시 데이터로 둘러보기**를 켜세요. "
+            "`products.csv` 하나만 있어도 평소 생산량 기준으로 예측이 돌아갑니다.")
+    st.markdown("##### 입력 변수")
+    st.dataframe(pd.DataFrame([
+        ('products.csv', '제품명, 판매가, 원가, 회수가, 평소 생산량', '1회', '회수가 = 다음 날 할인가 등. 없으면 0'),
+        ('recipe.csv', '제품 1개당 주요 재료량', '1회', '핵심 재료 2~5개면 충분'),
+        ('purchases.csv', '날짜, 재료, 수량', '과거분 일괄', '장부, 거래명세서에서 그대로 옮기면 됨'),
+        ('daily_log.csv', '날짜, 제품, 결과, (생산량)', '매일 마감 시',
+         '결과: 3 = 3개 남음, 15:30 = 15시 30분 품절, 0 = 마감 무렵 다 팔림, 빈칸 = 입력 안 함. '
+         '생산량은 평소와 다를 때만 입력'),
+        ('events.csv', '날짜, 태그', '선택', 'holiday, rain, event'),
+    ], columns=['파일', '내용', '입력 주기', '비고']), hide_index=True, width='stretch')
+    st.caption("매일 입력은 **제품당 값 하나**뿐입니다. 입력을 빠뜨린 날은 건너뛰고, 예측은 그대로 돌아갑니다.")
 
-                with f_col1:
-                    st.markdown("##### 1. 판매 활성도 기준 (Recency)")
-                    activity_opt = st.radio(
-                        "최근 판매일 기준:",
-                        ('전체', '최근 3개월', '최근 6개월', '최근 1년'),
-                        index=0,
-                        horizontal=True
+
+def render_plan_tab(model):
+    st.subheader("권장 생산량")
+    first = next_open_days(model, 1)[0]
+    c1, c2 = st.columns([1, 1])
+    start = c1.date_input("예측일", value=first.date(),
+                          min_value=(model.origin + pd.Timedelta(days=1)).date(), key='plan_start')
+    n_days = c2.slider("며칠치 볼까요", 1, 7, 1, key='plan_days')
+    dates = next_open_days(model, n_days, start=start)
+    st.caption(f"학습 기준일 **{model.origin:%Y-%m-%d}** - 이 날까지 들어온 매입장부와 마감 기록으로 계산했습니다.")
+    for n in model.notes:
+        st.info(n)
+
+    plan = model.plan(dates)
+    d0 = dates[0]
+    p0 = plan[plan['date'] == d0].set_index('product')
+    tags = model.event_tags(d0)
+    title = f"{d0.month}월 {d0.day}일 ({WEEKDAY_NAMES[d0.weekday()]})"
+    if tags:
+        title += ", " + ", ".join(tag_label(t) for t in tags)
+    st.markdown(f"#### {title}")
+
+    total_q, total_usual = int(p0['production'].sum()), int(p0['usual_qty'].sum())
+    m1, m2, m3 = st.columns(3)
+    m1.metric("권장 생산량 합계", f"{total_q}개", delta=f"평소 대비 {total_q - total_usual:+d}개",
+              delta_color='off')
+    m2.metric("예상 판매량 합계", f"{p0['mu'].sum():.0f}개")
+    m3.metric("학습에 쓴 마감 기록", f"{int(model.levels['n_obs'].sum())}건",
+              help="빈칸으로 둔 날은 건너뜁니다.")
+
+    table = pd.DataFrame({
+        '권장 생산량': p0['production'],
+        '평소 생산량': p0['usual_qty'].astype(int),
+        '예상 판매량': p0['mu'].round(1),
+        '품절 안 날 확률(목표)': (p0['service_level'] * 100).round().astype(int).astype(str) + '%',
+        '요일 계수': p0['weekday_coef'].round(2),
+        '시즌': p0['season'].round(2),
+        '이벤트': p0['event'].round(2),
+        '관측 비중': (model.levels.loc[p0.index, 'weight'] * 100).round().astype(int).astype(str) + '%',
+    })
+    table.index.name = '제품'
+    st.dataframe(table, width='stretch')
+    st.caption("남아도 손해가 적은 품목은 여유 있게, 버리면 손해가 큰 품목은 빠듯하게 만듭니다. "
+               "**관측 비중**은 마감 기록을 얼마나 믿었는지(나머지는 매입장부로 추정한 사전값)입니다.")
+
+    if n_days > 1:
+        st.markdown("##### 날짜별 권장 생산량")
+        wide = plan.assign(날짜=plan['date'].map(lambda d: f"{d:%m/%d}({WEEKDAY_NAMES[d.weekday()]})")) \
+                   .pivot(index='product', columns='날짜', values='production')
+        wide = wide[[f"{d:%m/%d}({WEEKDAY_NAMES[d.weekday()]})" for d in dates]]
+        wide.index.name = '제품'
+        st.dataframe(wide, width='stretch')
+
+    needs = model.ingredient_needs(plan)
+    if not needs.empty:
+        st.markdown("##### 필요한 재료량 (권장 생산량 기준, 재료 로스 포함)")
+        needs.index = [f"{d:%m/%d}({WEEKDAY_NAMES[d.weekday()]})" for d in needs.index]
+        st.dataframe(needs.T.round(2), width='stretch')
+
+    export = plan.assign(
+        날짜=plan['date'].dt.strftime('%Y-%m-%d'),
+        이벤트=plan['tags'].map(lambda t: ", ".join(tag_label(x) for x in t)),
+    ).rename(columns={'product': '제품', 'weekday': '요일', 'production': '권장 생산량',
+                      'mu': '예상 판매량', 'service_level': '목표 서비스수준',
+                      'usual_qty': '평소 생산량', 'weekday_coef': '요일 계수',
+                      'season': '시즌', 'event': '이벤트 배수'})
+    export = export[['날짜', '요일', '제품', '권장 생산량', '평소 생산량', '예상 판매량',
+                     '목표 서비스수준', '요일 계수', '시즌', '이벤트', '이벤트 배수']]
+    st.download_button("엑셀 다운로드", data=to_excel(export.round(3)),
+                       file_name=f"생산계획_{d0:%Y%m%d}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # ---------- 제품별 자세히 ----------
+    st.markdown("---")
+    st.subheader("제품별 자세히 보기")
+    prod = st.selectbox("제품", list(model.inputs.products.index), key='plan_product')
+    r = model.predict(prod, d0)
+    st.chat_message('assistant').markdown(explain_prediction(model, r))
+
+    g1, g2 = st.columns([1.5, 1])
+    with g1:
+        hist = model.demand[model.demand['product'] == prod].tail(60)
+        obs = hist[hist['kind'].isin(['남음', '품절', '마감 품절'])]
+        sold = np.where(obs['kind'] == '남음', obs['demand'], obs['production'])
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=obs['date'], y=sold, name='팔린 개수', marker_color='#C9D3DD'))
+        fig.add_trace(go.Scatter(x=hist['date'], y=hist['production'], name='생산량',
+                                 mode='lines', line=dict(color='#7F8C8D', dash='dot', shape='hv')))
+        cens = obs[obs['censored']]
+        fig.add_trace(go.Scatter(x=cens['date'], y=cens['demand'], name='품절 후 복원한 수요',
+                                 mode='markers', marker=dict(color='#E74C3C', size=9, symbol='x')))
+        pf = plan[plan['product'] == prod]
+        fig.add_trace(go.Scatter(x=pf['date'], y=pf['mu'], name='예상 판매량', mode='markers+lines',
+                                 marker=dict(color='#2E86C1', size=10, symbol='diamond')))
+        fig.add_trace(go.Scatter(x=pf['date'], y=pf['production'], name='권장 생산량', mode='markers',
+                                 marker=dict(color='#1E8449', size=11, symbol='triangle-up')))
+        fig.update_layout(height=380, hovermode='x unified', margin=dict(t=40, b=30, l=10, r=10),
+                          title=f"{prod} - 최근 마감 기록과 예측",
+                          legend=dict(orientation='h', yanchor='bottom', y=1.0))
+        st.plotly_chart(fig, width='stretch')
+    with g2:
+        st.dataframe(prediction_chain(model, r), hide_index=True, width='stretch')
+
+
+def render_steps_tab(model):
+    cfg = model.cfg
+    d0 = next_open_days(model, 1)[0]
+    st.subheader("계산 과정 (단계별)")
+    st.caption(f"학습 기준일 {model.origin:%Y-%m-%d}, 예측일 {d0:%Y-%m-%d} 기준")
+
+    # 1
+    st.markdown("#### 1. 매입에서 재료 일소비량 계산")
+    st.caption("빵집은 재료가 떨어질 즈음 삽니다. 그래서 한 번 산 재료는 다음 매입일까지 고르게 쓴다고 봅니다. "
+               "월요일에 밀가루 120kg을 사고 7일 뒤 다시 샀다면 하루 약 17kg을 쓴 셈입니다.")
+    if model.usage.empty:
+        st.info("매입장부가 없거나, 두 번 이상 산 재료가 없어 이 단계를 건너뛰었습니다.")
+    else:
+        u = model.usage.loc[:model.origin].tail(120)
+        fig = px.line(u, labels={'value': '하루 사용량', 'index': '날짜', 'variable': '재료'},
+                      title="재료별 하루 사용량 (최근 120일, 단위는 매입 단위 그대로)")
+        fig.update_layout(height=320, margin=dict(t=40, b=30, l=10, r=10), hovermode='x unified')
+        st.plotly_chart(fig, width='stretch')
+
+    # 2
+    st.markdown("#### 2. 역레시피 생산 추정과 사전값")
+    st.caption(f"최근 {cfg.bom_window_days}일 재료 소비량에서 제품별로 하루 몇 개를 만들었는지 거꾸로 계산합니다. "
+               f"계산이 불안정할 때는 '평소 생산량' 구성비가 결과를 잡아줍니다(bom_lambda {cfg.bom_lambda}). "
+               "이 값이 매일 입력이 없을 때 쓰는 사전값입니다.")
+    pr = model.inputs.products
+    st.dataframe(pd.DataFrame({
+        '평소 생산량': pr['usual_qty'],
+        '역레시피 추정 생산량': model.bom.production.round(1),
+        f"사전값 (생산량의 {1 - cfg.prior_waste:.0%})": model.levels['prior'].astype(float).round(1),
+    }).rename_axis('제품'), width='stretch')
+    if model.bom.method == '역레시피':
+        fit_df = pd.DataFrame({'실제 사용량': model.bom.usage, '추정 생산량으로 되짚은 사용량': model.bom.fitted})
+        fit_df['차이'] = ((fit_df.iloc[:, 1] / fit_df.iloc[:, 0] - 1) * 100).round(1).astype(str) + '%'
+        with st.expander("재료별 맞춤 정도 (영업일 하루 기준, 로스 제외)"):
+            st.dataframe(fit_df.round(3).rename_axis('재료'), width='stretch')
+            st.caption(f"전체 규모는 평소 생산량의 {model.bom.scale:.2f}배로 추정됐습니다.")
+
+    # 3
+    st.markdown("#### 3. 진짜 수요 복원")
+    share18 = cumulative_share(18, cfg)
+    st.caption(
+        "똑같이 30개 품절이어도 18시 품절과 21시 품절은 의미가 다릅니다. 시간대별 판매 비중으로 품절 뒤에 숨은 "
+        f"수요를 복원합니다. 지금 프로필에서는 18시까지 하루 수요의 {share18:.0%}가 들어오므로 18시 품절이면 "
+        f"30 / {share18:.2f} = {30 / share18:.0f}개입니다. 3개가 남았다면 수요는 그대로 27개입니다. "
+        f"아주 이른 품절로 과대추정되지 않도록 보정은 생산량의 {cfg.max_uplift:g}배까지만 인정합니다."
+    )
+    dm = model.demand
+    if dm.empty:
+        st.info("아직 마감 기록(daily_log.csv)이 없습니다. 사전값만으로 예측합니다.")
+    else:
+        counts = dm['kind'].value_counts()
+        st.write(", ".join(f"{k} {v}건" for k, v in counts.items()))
+        show = dm.sort_values('date', ascending=False).head(40).assign(
+            날짜=lambda x: x['date'].dt.strftime('%Y-%m-%d'),
+            판매비중=lambda x: x['share_at_sellout'].map(lambda v: '' if pd.isna(v) else f"{v:.0%}"),
+        )
+        st.dataframe(show[['날짜', 'product', 'production', 'result', 'kind', '판매비중', 'demand']]
+                     .rename(columns={'product': '제품', 'production': '생산량', 'result': '입력값',
+                                      'kind': '해석', '판매비중': '품절 시각까지 판매 비중',
+                                      'demand': '복원 수요'}).round(1),
+                     hide_index=True, width='stretch', height=300)
+
+    # 4
+    st.markdown("#### 4. 수준, 요일 계수 학습")
+    st.caption(f"요일 효과를 뺀 뒤 최근 값에 가중치를 더 주는 평균(EWMA, alpha {cfg.alpha})으로 수준을 학습하고, "
+               f"관측값과 사전값을 n/(n+k) 비율로 섞습니다 (k={cfg.k_cred:g}: 5일이면 50:50, 20일이면 관측 80%). "
+               f"요일 계수도 같은 방식이라 관측이 적은 요일은 매장 전체 평균 쪽에 무게를 둡니다(k={cfg.k_weekday:g}).")
+    lv = model.levels
+    st.dataframe(pd.DataFrame({
+        '사전값': lv['prior'].astype(float).round(1),
+        '관측 수준(EWMA)': lv['ewma'].astype(float).round(1),
+        '입력 일수 n': lv['n_obs'],
+        '품절 복원 일수': lv['n_censored'].astype(int),
+        '관측 비중': (lv['weight'].astype(float) * 100).round().astype(int).astype(str) + '%',
+        '학습 수준': lv['level'].astype(float).round(1),
+        '변동계수(CV)': lv['cv'].astype(float).round(3),
+    }).rename_axis('제품'), width='stretch')
+    wd = pd.concat([model.store_weekday.to_frame('매장 전체').T, model.weekday])
+    wd.columns = WEEKDAY_NAMES
+    st.dataframe(wd.round(2).style.background_gradient(cmap='RdBu_r', vmin=0.6, vmax=1.4, axis=None),
+                 width='stretch')
+
+    # 5
+    st.markdown("#### 5. 시즌, 이벤트 보정")
+    if model.season_enabled:
+        sf = model.season_factors(d0)
+        st.caption(f"매입 이력이 1년 이상이라, 작년 같은 시기에 지금부터 예측일({d0:%m/%d})까지 생산량이 얼마나 "
+                   f"늘거나 줄었는지를 매입 흐름으로 계산해 반영합니다 "
+                   f"({cfg.season_bounds[0]:g}~{cfg.season_bounds[1]:g}로 제한).")
+        st.dataframe(sf.round(3).to_frame('시즌 보정').rename_axis('제품').T, width='stretch')
+    else:
+        st.caption("매입 이력이 1년 미만이라 시즌 보정은 쓰지 않았습니다.")
+    tags = model.event_tags(d0)
+    st.caption("이벤트 배수: " + ", ".join(f"{tag_label(t)} {f:g}배" for t, f in cfg.event_factors.items())
+               + f". {d0:%m/%d} 이벤트: " + (", ".join(tag_label(t) for t in tags) or "없음"))
+
+    # 6
+    st.markdown("#### 6. 권장 생산량")
+    st.caption("예측 수요에 마진과 폐기 손실을 고려한 여유분을 더합니다. "
+               "목표 서비스수준(품절이 나지 않을 확률) = (판매가 - 원가) / (판매가 - 회수가).")
+    raw_sl = (pr['price'] - pr['cost']) / (pr['price'] - pr['salvage']).where(lambda s: s > 0)
+    applied = pd.Series({p: model.predict(p, d0)['service_level'] for p in pr.index})
+    st.dataframe(pd.DataFrame({
+        '판매가': pr['price'], '원가': pr['cost'], '회수가': pr['salvage'],
+        '계산값': raw_sl.round(3), '적용 서비스수준': applied.round(3),
+    }).rename_axis('제품'), width='stretch')
+
+
+def parse_whatif_text(text, tags_available):
+    """채팅 문구에서 이벤트 태그, 요일을 읽는다. LLM이 없으면 키워드 매칭(NLU 아님)."""
+    parsed = parse_events_llm(text)
+    if parsed is not None:
+        tags = [t for t in ('holiday', 'rain', 'event') if parsed.get(t)]
+        weekday = parsed.get('weekday')
+    else:
+        tags = [t for t, kws in WHATIF_KEYWORDS.items() if any(k in text for k in kws)]
+        weekday = next((i for i, n in enumerate(WEEKDAY_NAMES) if f"{n}요일" in text), None)
+        if weekday is None and '주말' in text:
+            weekday = 5
+    return [t for t in tags if t in tags_available], weekday
+
+
+def render_whatif_tab(model):
+    cfg = model.cfg
+    st.subheader("What-if - 조건별 예상 판매량")
+    st.caption("날짜와 이벤트 조건을 바꾸면 예상 판매량과 권장 생산량이 바로 바뀝니다. "
+               "계산은 '생산량 추천'과 같은 모델(요일 계수, 시즌, 이벤트 배수, 목표 서비스수준)입니다.")
+
+    c1, c2 = st.columns([1, 1])
+    prod = c1.selectbox("제품", list(model.inputs.products.index), key='wi_product')
+    date = pd.Timestamp(c2.date_input(
+        "날짜", value=next_open_days(model, 1)[0].date(),
+        min_value=(model.origin + pd.Timedelta(days=1)).date(), key='wi_date'))
+    if date.weekday() in cfg.closed_weekdays:
+        st.warning(f"{WEEKDAY_NAMES[date.weekday()]}요일은 정기 휴무일입니다.")
+        return
+
+    st.markdown("##### 이벤트 조건")
+    planned = set(model.event_tags(date))
+    cols = st.columns(max(len(cfg.event_factors), 1))
+    chosen = []
+    for col, (tag, factor) in zip(cols, cfg.event_factors.items()):
+        if col.checkbox(f"{tag_label(tag)} ({factor:g}배)", value=tag in planned, key=f"wi_tag_{tag}_{date:%Y%m%d}"):
+            chosen.append(tag)
+    if planned:
+        st.caption("events.csv 에 이 날짜로 적힌 이벤트는 미리 체크해 두었습니다.")
+
+    base = model.predict(prod, date, tags=[])
+    live = model.predict(prod, date, tags=chosen)
+    pct = (live['mu'] / base['mu'] - 1) * 100 if base['mu'] > 0 else 0.0
+    r1, r2, r3 = st.columns(3)
+    r1.metric(f"조건 없을 때 ({live['weekday']})", f"{base['mu']:.0f}개")
+    r2.metric("조건 반영 예상 판매량", f"{live['mu']:.0f}개", delta=f"{pct:+.1f}%")
+    r3.metric(f"권장 생산량 (목표 {live['service_level']:.0%})", f"{live['production']}개")
+
+    with st.expander("모든 제품 보기"):
+        rows = []
+        for p in model.inputs.products.index:
+            b, l = model.predict(p, date, tags=[]), model.predict(p, date, tags=chosen)
+            rows.append({'제품': p, '조건 없을 때': round(b['mu'], 1), '조건 반영': round(l['mu'], 1),
+                         '권장 생산량': l['production'], '평소 생산량': int(l['usual_qty'])})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+
+    # ---------- 채팅 ----------
+    st.markdown("---")
+    st.markdown("##### 문장으로 물어보기")
+    st.caption("예: '토요일에 비 오면?', '공휴일에 행사까지 하면 크루아상 몇 개?' "
+               " - 요일을 말하면 그 요일의 가장 가까운 날로 계산합니다.")
+    if 'whatif_messages' not in st.session_state:
+        st.session_state.whatif_messages = []
+    if st.button("대화 초기화", key='whatif_clear'):
+        st.session_state.whatif_messages = []
+        st.rerun()
+    for msg in st.session_state.whatif_messages:
+        st.chat_message(msg['role']).write(msg['content'])
+
+    user_text = st.chat_input(f"'{prod}'에 대해 물어보세요 (예: 토요일에 비 오면?)")
+    if not user_text:
+        return
+    st.session_state.whatif_messages.append({'role': 'user', 'content': user_text})
+    tags, weekday = parse_whatif_text(user_text, set(cfg.event_factors))
+    q_date = date
+    if weekday is not None and weekday not in cfg.closed_weekdays:
+        q_date = next(d for d in next_open_days(model, 14) if d.weekday() == weekday)
+    b = model.predict(prod, q_date, tags=[])
+    r = model.predict(prod, q_date, tags=tags)
+    cond_str = ", ".join(tag_label(t) for t in tags) or "특별한 이벤트 없음"
+    pct = (r['mu'] / b['mu'] - 1) * 100 if b['mu'] > 0 else 0.0
+    reply = (f"{q_date:%m/%d}({r['weekday']}), 조건({cond_str})이면 '{prod}' 예상 판매량은 "
+             f"{b['mu']:.0f}개에서 **{r['mu']:.0f}개**로 바뀝니다({pct:+.1f}%). "
+             f"품절이 나지 않을 확률 {r['service_level']:.0%}를 목표로 한 권장 생산량은 **{r['production']}개**입니다.")
+    ctx = {'item': prod, 'weekday': f"{r['weekday']}요일", 'cond_str': cond_str, 'base': b['mu'],
+           'final': r['mu'], 'pct': pct, 'sl': r['service_level'], 'production': r['production']}
+
+    with st.chat_message('user'):
+        st.markdown(user_text)
+    with st.chat_message('assistant'):
+        try:
+            streamed = st.write_stream(stream_reply(ctx))
+        except Exception as e:
+            print(f"[whatif_llm] 스트리밍 실패: {e}")
+            streamed = None
+        if not streamed:
+            st.markdown(reply)
+            streamed = reply
+    st.session_state.whatif_messages.append({'role': 'assistant', 'content': streamed})
+
+
+# -----------------------------------------------------------------------------
+# 10. 메인 UI 구성
+# -----------------------------------------------------------------------------
+st.title(f"{CURRENT_USER['shop_name']} - AI 수요 예측")
+st.write("매입장부와 매일 마감 기록 한 줄로 내일 몇 개 만들지 추천합니다.")
+
+USER_DIR = auth_store.user_data_dir(CURRENT_USER['id'])
+if 'cfg_base' not in st.session_state:
+    _cfg_path = USER_DIR / CONFIG_FILE
+    st.session_state.cfg_base = (Config.load(_cfg_path) if _cfg_path.exists() else Config()).to_dict()
+
+# --- 사용자별 입력 파일 ---
+# 올린 파일은 계정별로 분리된 data/users/<user_id>/ 아래 고정 이름으로 저장된다.
+# 다음 접속 때 다시 올릴 필요 없이 마지막 파일을 그대로 쓴다(daily_log 는 매일 새로 올리면 덮어쓴다).
+with st.sidebar:
+    st.header("입력 파일")
+    use_sample = st.checkbox("동봉된 예시 데이터로 둘러보기", key='main_sample')
+    blobs = {}
+    if use_sample:
+        for key, fname in FILE_NAMES.items():
+            if (SAMPLE_INPUT_DIR / fname).exists():
+                blobs[key] = (SAMPLE_INPUT_DIR / fname).read_bytes()
+    else:
+        for key, fname in FILE_NAMES.items():
+            saved = USER_DIR / fname
+            up = st.file_uploader(fname, type=['csv'], key=f'up_{key}', help=INPUT_HELP[key])
+            if up is not None:
+                data = up.getvalue()
+                try:
+                    if not saved.exists() or saved.read_bytes() != data:
+                        saved.write_bytes(data)
+                        auth_store.record_dataset(
+                            CURRENT_USER['id'], fname, saved,
+                            n_rows=max(len(data.splitlines()) - 1, 0),
+                        )
+                except Exception as e:
+                    st.warning(f"{fname} 보관에 실패했습니다(분석은 그대로 진행됩니다): {e}")
+                blobs[key] = data
+            elif saved.exists():
+                blobs[key] = saved.read_bytes()
+        st.caption("  \n".join(
+            f"{f}: " + ("저장된 파일 사용" if k in blobs and st.session_state.get(f'up_{k}') is None
+                        else "올림" if k in blobs else "없음(선택)" if k == 'events' else "없음")
+            for k, f in FILE_NAMES.items()
+        ))
+
+    with st.expander("입력 양식 내려받기"):
+        for key, fname in FILE_NAMES.items():
+            if (SAMPLE_INPUT_DIR / fname).exists():
+                st.download_button(fname, (SAMPLE_INPUT_DIR / fname).read_bytes(), file_name=fname,
+                                   mime='text/csv', key=f'tpl_{key}', help=INPUT_HELP[key])
+
+tab_plan, tab_steps, tab_whatif, tab_cfg, tab_alert, tab_shap, tab_h1 = st.tabs([
+    "생산량 추천", "계산 과정", "What-if 채팅", "환경 변수",
+    "판매 이상 알림 (POS)", "SHAP 기여도 (POS)", "이벤트 우선 예측 (H1)",
+])
+
+# 설정 탭을 먼저 그려야 바뀐 값으로 예측할 수 있다(화면상 탭 순서와 무관).
+with tab_cfg:
+    CFG = render_config_editor(Config.from_dict(st.session_state.cfg_base), USER_DIR)
+
+MODEL, LOAD_ERROR = None, None
+if 'products' in blobs:
+    try:
+        with st.spinner("매입장부와 마감 기록을 학습하는 중..."):
+            MODEL = build_model(tuple(sorted(blobs.items())),
+                                json.dumps(CFG.to_dict(), ensure_ascii=False, sort_keys=True))
+        st.sidebar.success(f"학습 완료, 기준일 {MODEL.origin:%Y-%m-%d}")
+    except InputError as e:
+        LOAD_ERROR = str(e)
+    except Exception as e:
+        LOAD_ERROR = f"입력 파일을 처리하지 못했습니다: {e}"
+if LOAD_ERROR:
+    st.sidebar.error(LOAD_ERROR)
+
+for _tab, _render in ((tab_plan, render_plan_tab), (tab_steps, render_steps_tab),
+                      (tab_whatif, render_whatif_tab)):
+    with _tab:
+        if MODEL is None:
+            if LOAD_ERROR:
+                st.error(LOAD_ERROR)
+            render_input_guide()
+        else:
+            _render(MODEL)
+
+# 탭 3: 판매 이상 알림 (재고 판단용)
+with tab_alert:
+    st.subheader("판매 이상 알림")
+    st.caption(
+        "평소와 다르게 팔린 날을 찾아드립니다. "
+        "'평소'는 **직전 4주간 같은 요일의 평균**입니다 - 토요일은 토요일끼리 비교합니다."
+    )
+
+    alert_file = st.file_uploader(
+        "판매 데이터 CSV 업로드 (date, item, sales_qty 컬럼 포함)",
+        type=['csv'], key='anomaly_csv'
+    )
+    if alert_file is None and SAMPLE_DATA_PATH.exists():
+        if st.checkbox("동봉된 예시 데이터로 둘러보기", key='anomaly_sample'):
+            alert_file = str(SAMPLE_DATA_PATH)
+
+    if alert_file is None:
+        st.info("판매 데이터를 올리시면 재고 판단에 쓸 알림을 만들어 드립니다.")
+    else:
+        adf = load_event_dataset(alert_file)
+        missing_cols = {'date', 'item', 'sales_qty'} - set(adf.columns)
+
+        if missing_cols:
+            st.error(f"필수 컬럼이 없습니다: {', '.join(sorted(missing_cols))}")
+        elif not ML_AVAILABLE:
+            st.warning("분석에 필요한 라이브러리(scikit-learn)가 설치되어 있지 않습니다.")
+        else:
+            daily_total = adf.groupby('date')['sales_qty'].sum().asfreq('D').fillna(0.0)
+            all_items = sorted(adf['item'].unique())
+            by_item = {
+                it: adf[adf['item'] == it].groupby('date')['sales_qty'].sum()
+                      .reindex(daily_total.index, fill_value=0.0)
+                for it in all_items
+            }
+
+            if len(daily_total) < 40:
+                st.warning("분석하려면 최소 40일치 데이터가 필요합니다.")
+            else:
+                period = st.radio(
+                    "확인할 기간", [30, 60, 90], index=0, horizontal=True,
+                    format_func=lambda d: f"최근 {d}일", key='alert_period'
+                )
+
+                with st.spinner("판매 흐름을 살펴보는 중입니다..."):
+                    # 시즌, 공휴일, 날씨를 알면 '왜 그랬는지'까지 말해줄 수 있다.
+                    context = build_context(adf)
+                    alerts = build_alerts(by_item, daily_total, all_items,
+                                           recent_days=period, context=context)
+                    trends = {it: trend_summary(by_item[it]) for it in all_items}
+
+                n_high = sum(1 for a in alerts if a['severity'] == '높음')
+                n_short = sum(1 for a in alerts if a['pct'] > 0)
+                n_over = sum(1 for a in alerts if a['pct'] < 0)
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("눈여겨볼 날", f"{len(alerts)}건",
+                          help=f"최근 {period}일 중 평소와 20% 이상 차이 난 날")
+                m2.metric("품절 위험 (많이 팔린 날)", f"{n_short}건")
+                m3.metric("재고 과잉 위험 (적게 팔린 날)", f"{n_over}건")
+
+                # ---------- 1. 알림 카드 ----------
+                st.markdown("### 이런 날이 있었어요")
+                if not alerts:
+                    st.success(
+                        f"최근 {period}일 동안 평소와 크게 다른 날이 없었습니다. "
+                        "판매가 안정적입니다."
                     )
-
-                with f_col2:
-                    st.markdown("##### 2. 판매 규모 등급 (Volume)")
-                    # 등급 목록 생성 (순서 보장)
-                    tier_options = ['전체', '💎 시그니처 메뉴 (상위 10%)', '🥇 인기 메뉴 (상위 30%)', '🥈 스테디셀러 (상위 60%)', '🥉 일반 품목']
-                    tier_opt = st.selectbox("품목 등급 기준:", tier_options, index=0)
-
-            # --- [필터링 로직 적용] ---
-            # 1. 기간 필터링
-            last_dates = df.groupby('Item')['Date'].max().reset_index()
-            if activity_opt == '최근 3개월':
-                cutoff = max_date - timedelta(days=90)
-                active_item_list = last_dates[last_dates['Date'] >= cutoff]['Item'].tolist()
-            elif activity_opt == '최근 6개월':
-                cutoff = max_date - timedelta(days=180)
-                active_item_list = last_dates[last_dates['Date'] >= cutoff]['Item'].tolist()
-            elif activity_opt == '최근 1년':
-                cutoff = max_date - timedelta(days=365)
-                active_item_list = last_dates[last_dates['Date'] >= cutoff]['Item'].tolist()
-            else:
-                active_item_list = last_dates['Item'].tolist()
-
-            # 2. 등급 필터링
-            if tier_opt != '전체':
-                tier_item_list = tier_df[tier_df['Tier'] == tier_opt]['Item'].tolist()
-            else:
-                tier_item_list = tier_df['Item'].tolist()
-
-            # 교집합 (두 조건 모두 만족)
-            final_item_list = list(set(active_item_list) & set(tier_item_list))
-            final_item_list.sort()
-
-            # --- [선택 UI] ---
-            st.divider()
-            c_info, c_select = st.columns([1, 2])
-
-            with c_info:
-                st.metric("조건 만족 품목 수", f"{len(final_item_list)} 개")
-                if tier_opt != '전체':
-                    st.caption(f"선택 등급: {tier_opt}")
-                if activity_opt != '전체':
-                    st.caption(f"판매 기간: {activity_opt} 이내")
-
-            with c_select:
-                search_txt = st.text_input("품목명 검색", placeholder="예: 식빵")
-                display_list = [c for c in final_item_list if search_txt in c] if search_txt else final_item_list
-                selected_item = st.selectbox("분석 대상 선택:", display_list, index=None, placeholder="목록에서 선택하세요...")
-
-            # --- [분석 실행] ---
-            if selected_item:
-                st.markdown(f"### 🎯 '{selected_item}' 앙상블 예측")
-
-                # 품목 등급 표시
-                item_tier_info = tier_df[tier_df['Item'] == selected_item]['Tier'].values[0]
-                st.info(f"이 품목은 **{item_tier_info}** 입니다.")
-
-                item_df = df[df['Item'] == selected_item].sort_values('Date')
-                item_weekly = item_df.set_index('Date').resample('W-MON')['Quantity'].sum()
-
-                start_date = item_weekly[item_weekly > 0].index.min()
-                if pd.isna(start_date): start_date = item_weekly.index.min()
-
-                full_idx = pd.date_range(start=start_date, end=max_date, freq='W-MON')
-                item_weekly = item_weekly.reindex(full_idx, fill_value=0)
-                series_data = item_weekly.values
-
-                with st.spinner("예측 모델 분석 중..."):
-                    p_linear = predict_linear_trend_force(series_data, 5)
-                    p_holt = predict_holt_trend(series_data, 5)
-                    p_arima = predict_arima_trend(series_data, 5)
-                    p_prophet = predict_prophet(item_weekly, 5, freq='W-MON') if PROPHET_AVAILABLE else [0] * 5
-                    p_tft = predict_tft(item_weekly, 5, freq='W-MON') if TFT_AVAILABLE else [0] * 5
-
-                    p_rf = predict_rf(series_data, 5) if ML_AVAILABLE else [0] * 5
-                    p_xgb = predict_xgboost(series_data, 5) if ML_AVAILABLE else [0] * 5
-                    p_lstm = predict_lstm(series_data, 5) if TF_AVAILABLE else [0] * 5
-
-                    valid_preds = [p_linear, p_holt, p_arima]
-                    if PROPHET_AVAILABLE: valid_preds.append(p_prophet)
-                    if TFT_AVAILABLE: valid_preds.append(p_tft)
-                    if ML_AVAILABLE: valid_preds.extend([p_rf, p_xgb])
-                    if TF_AVAILABLE: valid_preds.append(p_lstm)
-
-                    ens_pred = np.mean(valid_preds, axis=0)
-                    ens_pred = [round(max(0, x), 1) for x in ens_pred]
-
-                dates_str = [(max_date + timedelta(weeks=i)).strftime('%Y-%m-%d') for i in range(1, 6)]
-
-                res_df = pd.DataFrame({
-                    '날짜': dates_str,
-                    '앙상블(최종)': ens_pred,
-                    '선형추세': [round(max(0, x), 1) for x in p_linear],
-                    'Holt': [round(max(0, x), 1) for x in p_holt],
-                    'Prophet': [round(max(0, x), 1) for x in p_prophet],
-                    'TFT': [round(max(0, x), 1) for x in p_tft],
-                })
-
-                st.subheader("📋 예측 결과표")
-                st.dataframe(res_df.set_index('날짜'), use_container_width=True)
-                st.download_button("💾 엑셀 다운로드", data=to_excel(res_df), file_name=f"{selected_item}_예측.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-                st.markdown("---")
-                st.subheader("📈 추세 그래프")
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=item_weekly.index[-20:], y=item_weekly.values[-20:], name='과거 판매실적',
-                                         line=dict(color='gray', dash='dot')))
-                fig.add_trace(go.Scatter(x=pd.to_datetime(res_df['날짜']), y=res_df['앙상블(최종)'], name='앙상블(추세반영)',
-                                         line=dict(color='red', width=4)))
-                fig.add_trace(go.Scatter(x=pd.to_datetime(res_df['날짜']), y=res_df['선형추세'], name='선형추세',
-                                         line=dict(color='blue', width=1, dash='dot')))
-                fig.update_layout(height=500, hovermode="x unified", title=f"{selected_item} 향후 5주 판매 추세")
-                st.plotly_chart(fig, use_container_width=True)
-
-                st.markdown("---")
-                st.subheader("🤖 에이전트 브리핑 (조회 → 예측 → 해석 → 브리핑)")
-                if LANGGRAPH_AVAILABLE:
-                    with st.spinner("에이전트가 브리핑을 생성하는 중..."):
-                        agent = build_briefing_agent()
-                        agent_state = agent.invoke({
-                            "item": selected_item,
-                            "tier": item_tier_info,
-                            "history": [float(v) for v in item_weekly.values],
-                            "forecast": [float(v) for v in ens_pred],
-                            "dates": dates_str,
-                        })
-                    st.chat_message("assistant").write(agent_state["briefing"])
                 else:
-                    st.warning("langgraph가 설치되어 있지 않습니다. `pip install langgraph` 후 에이전트 브리핑을 사용할 수 있습니다.")
-
-            else:
-                # 미선택 시 목록 보여주기
-                if display_list:
-                    st.markdown(f"### 📋 조회된 품목 목록 ({len(display_list)}개)")
-
-                    # 상세 정보 병합 (마지막 판매일, 총판매량, 등급)
-                    list_df = df[df['Item'].isin(display_list)].groupby('Item').agg(
-                        마지막판매일=('Date', 'max'),
-                        총판매량=('Quantity', 'sum')
-                    ).reset_index()
-
-                    # 등급 정보 병합
-                    list_df = pd.merge(list_df, tier_df[['Item', 'Tier']], on='Item', how='left')
-                    list_df['마지막판매일'] = list_df['마지막판매일'].dt.strftime('%Y-%m-%d')
-                    list_df = list_df.sort_values(['총판매량', '마지막판매일'], ascending=[False, False])  # 판매량 순 정렬
-
-                    st.dataframe(list_df, use_container_width=True, hide_index=True)
-                else:
-                    st.warning("조건에 맞는 품목이 없습니다. 필터를 변경해보세요.")
-
-        # 탭 2: 베스트셀러 TOP N
-        with tab_top:
-            st.subheader("🏆 베스트셀러 품목 일괄 예측")
-            top_n = st.radio("분석 개수:", [10, 20, 30], horizontal=True)
-
-            if st.button("Top N 분석 시작", type="primary"):
-                top_items = df.groupby('Item')['Quantity'].sum().nlargest(top_n).index.tolist()
-                results = []
-                dates_str = [(max_date + timedelta(weeks=i)).strftime('%Y-%m-%d') for i in range(1, 6)]
-
-                bar = st.progress(0)
-                for idx, item in enumerate(top_items):
-                    i_df = df[df['Item'] == item].sort_values('Date')
-                    i_weekly = i_df.set_index('Date').resample('W-MON')['Quantity'].sum()
-                    start_d = i_weekly[i_weekly > 0].index.min()
-                    if pd.isna(start_d): start_d = i_weekly.index.min()
-                    i_series = i_weekly.reindex(pd.date_range(start=start_d, end=max_date, freq='W-MON'),
-                                                fill_value=0).values
-
-                    p1 = predict_linear_trend_force(i_series, 5)
-                    p2 = predict_holt_trend(i_series, 5)
-                    avg = np.mean([p1, p2], axis=0)
-
-                    row = {'품목명': item}
-                    for i, d in enumerate(dates_str): row[f'{i + 1}주차 ({d})'] = round(max(0, avg[i]), 1)
-                    results.append(row)
-                    bar.progress((idx + 1) / top_n)
-
-                top_df = pd.DataFrame(results)
-                st.dataframe(top_df, use_container_width=True)
-                st.download_button("💾 Top N 결과 엑셀 다운로드", data=to_excel(top_df), file_name=f"Top{top_n}_예측.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-                st.markdown("---")
-                if st.toggle("종합 그래프 보기", value=True):
-                    plot_df = top_df.melt(id_vars=['품목명'], var_name='주차', value_name='예측수량')
-                    fig2 = px.line(plot_df, x='주차', y='예측수량', color='품목명', markers=True, title=f"Top {top_n} 품목 판매 추세")
-                    fig2.update_layout(height=600, hovermode="x unified")
-                    st.plotly_chart(fig2, use_container_width=True)
-
-        # 탭 3: 판매 이상 알림 (재고 판단용)
-        with tab_alert:
-            st.subheader("📦 판매 이상 알림")
-            st.caption(
-                "평소와 다르게 팔린 날을 찾아드립니다. "
-                "'평소'는 **직전 4주간 같은 요일의 평균**입니다 — 토요일은 토요일끼리 비교합니다."
-            )
-
-            alert_file = st.file_uploader(
-                "판매 데이터 CSV 업로드 (date, item, sales_qty 컬럼 포함)",
-                type=['csv'], key='anomaly_csv'
-            )
-            if alert_file is None and SAMPLE_DATA_PATH.exists():
-                if st.checkbox("동봉된 예시 데이터로 둘러보기", key='anomaly_sample'):
-                    alert_file = str(SAMPLE_DATA_PATH)
-
-            if alert_file is None:
-                st.info("👆 판매 데이터를 올리시면 재고 판단에 쓸 알림을 만들어 드립니다.")
-            else:
-                adf = load_event_dataset(alert_file)
-                missing_cols = {'date', 'item', 'sales_qty'} - set(adf.columns)
-
-                if missing_cols:
-                    st.error(f"필수 컬럼이 없습니다: {', '.join(sorted(missing_cols))}")
-                elif not ML_AVAILABLE:
-                    st.warning("분석에 필요한 라이브러리(scikit-learn)가 설치되어 있지 않습니다.")
-                else:
-                    daily_total = adf.groupby('date')['sales_qty'].sum().asfreq('D').fillna(0.0)
-                    all_items = sorted(adf['item'].unique())
-                    by_item = {
-                        it: adf[adf['item'] == it].groupby('date')['sales_qty'].sum()
-                              .reindex(daily_total.index, fill_value=0.0)
-                        for it in all_items
-                    }
-
-                    if len(daily_total) < 40:
-                        st.warning("분석하려면 최소 40일치 데이터가 필요합니다.")
-                    else:
-                        period = st.radio(
-                            "확인할 기간", [30, 60, 90], index=0, horizontal=True,
-                            format_func=lambda d: f"최근 {d}일", key='alert_period'
-                        )
-
-                        with st.spinner("판매 흐름을 살펴보는 중입니다..."):
-                            # 시즌·공휴일·날씨를 알면 '왜 그랬는지'까지 말해줄 수 있다.
-                            context = build_context(adf)
-                            alerts = build_alerts(by_item, daily_total, all_items,
-                                                   recent_days=period, context=context)
-                            trends = {it: trend_summary(by_item[it]) for it in all_items}
-
-                        n_high = sum(1 for a in alerts if a['severity'] == '높음')
-                        n_short = sum(1 for a in alerts if a['pct'] > 0)
-                        n_over = sum(1 for a in alerts if a['pct'] < 0)
-
-                        m1, m2, m3 = st.columns(3)
-                        m1.metric("눈여겨볼 날", f"{len(alerts)}건",
-                                  help=f"최근 {period}일 중 평소와 20% 이상 차이 난 날")
-                        m2.metric("품절 위험 (많이 팔린 날)", f"{n_short}건")
-                        m3.metric("재고 과잉 위험 (적게 팔린 날)", f"{n_over}건")
-
-                        # ---------- 1. 알림 카드 ----------
-                        st.markdown("### ⚠️ 이런 날이 있었어요")
-                        if not alerts:
-                            st.success(
-                                f"최근 {period}일 동안 평소와 크게 다른 날이 없었습니다. "
-                                "판매가 안정적입니다."
-                            )
-                        else:
-                            n_event = sum(1 for a in alerts if a['is_event'])
-                            if n_event:
-                                st.caption(
-                                    f"이 가운데 {n_event}건은 시즌·공휴일·날씨로 설명되는 날입니다. "
-                                    "**원인을 알 수 없는 날을 먼저** 보여드립니다."
-                                )
-                            elif n_high:
-                                st.caption(f"특히 눈여겨볼 것 {n_high}건을 맨 위에 두었습니다.")
-
-                            show_items = st.multiselect(
-                                "품목으로 좁혀보기 (비워두면 전체)",
-                                sorted({a['item'] for a in alerts}), key='alert_filter'
-                            )
-                            shown = [a for a in alerts if not show_items or a['item'] in show_items]
-
-                            for a in shown[:20]:
-                                with st.container(border=True):
-                                    if a['is_event']:
-                                        tag = '🗓 이유를 아는 날'
-                                    else:
-                                        tag = {'높음': '🔴 눈여겨보세요',
-                                               '보통': '🟡 참고하세요',
-                                               '낮음': '⚪ 가벼운 차이'}[a['severity']]
-                                    st.markdown(f"**{a['icon']} {a['headline']}**")
-                                    st.caption(f"{tag}  ·  {a['detail']}")
-                                    st.markdown(f"→ {a['meaning']} {a['action']}")
-                                    if a['cause']:
-                                        st.caption(a['cause'])
-
-                            if len(shown) > 20:
-                                st.caption(f"이 밖에 {len(shown) - 20}건이 더 있습니다.")
-
-                        # ---------- 2. 요즘 추세 ----------
-                        st.markdown("### 📈 요즘 잘 나가고 있나요?")
-                        st.caption("하루 튄 것보다 **몇 주에 걸친 변화**가 발주량 조정에 더 중요합니다.")
-
-                        trend_rows = []
-                        for it, t in trends.items():
-                            if t is None:
-                                continue
-                            trend_rows.append({
-                                '품목': it,
-                                '방향': ('▲ 늘고 있음' if t['direction'] == '상승' else '▼ 줄고 있음'),
-                                '최근 4주 변화': f"{t['change'] * 100:+.0f}%",
-                                '이렇게 해보세요': t['action'],
-                            })
-
-                        if trend_rows:
-                            trend_df = pd.DataFrame(trend_rows).sort_values(
-                                '최근 4주 변화',
-                                key=lambda s: s.str.rstrip('%').astype(float),
-                                ascending=False,
-                            )
-                            st.dataframe(trend_df, use_container_width=True, hide_index=True)
-                        else:
-                            st.info("최근 4주간 뚜렷하게 늘거나 줄어든 품목이 없습니다.")
-
-                        # ---------- 3. 요일별 준비량 ----------
-                        st.markdown("### 📅 요일별 준비량 가이드")
-                        st.caption("최근 4주 실적을 요일별로 모은 표입니다. 내일 몇 개 준비할지 정할 때 쓰세요.")
-
-                        guide_item = st.selectbox("품목 선택", all_items, key='guide_item')
-                        guide = weekday_guide(by_item[guide_item])
-
-                        if guide is None:
-                            st.info("이 품목은 데이터가 부족해 요일별 가이드를 만들 수 없습니다.")
-                        else:
-                            gc1, gc2 = st.columns([1, 1.4])
-                            with gc1:
-                                st.dataframe(guide, use_container_width=True, hide_index=True)
-                                st.caption(
-                                    "**권장 준비량**은 평균보다 10% 여유를 둔 값입니다. "
-                                    "품절보다 약간의 여유가 낫다는 기준이며, 폐기가 부담되면 평균에 맞추세요."
-                                )
-                            with gc2:
-                                # 최근 60일 판매 흐름 + 평소 범위
-                                s = by_item[guide_item].tail(60)
-                                _, exp = weekday_residual(by_item[guide_item])
-                                exp = exp.reindex(s.index)
-
-                                figg = go.Figure()
-                                figg.add_trace(go.Scatter(
-                                    x=s.index, y=exp * 1.3, name='평소 범위(위)',
-                                    line=dict(width=0), showlegend=False, hoverinfo='skip'))
-                                figg.add_trace(go.Scatter(
-                                    x=s.index, y=exp * 0.7, name='평소 범위',
-                                    line=dict(width=0), fill='tonexty',
-                                    fillcolor='rgba(120,170,220,0.18)', hoverinfo='skip'))
-                                figg.add_trace(go.Scatter(
-                                    x=s.index, y=s, name='실제 판매량',
-                                    line=dict(color='#2C3E50', width=2)))
-
-                                hit_dates = [a['date'] for a in alerts if a['item'] == guide_item
-                                             and a['date'] in s.index]
-                                if hit_dates:
-                                    figg.add_trace(go.Scatter(
-                                        x=hit_dates, y=s.loc[hit_dates], mode='markers',
-                                        name='평소와 달랐던 날',
-                                        marker=dict(color='#E74C3C', size=10, symbol='circle')))
-
-                                figg.update_layout(
-                                    height=330, hovermode='x unified',
-                                    title=f"{guide_item} — 최근 60일",
-                                    margin=dict(t=45, b=30, l=10, r=10),
-                                    legend=dict(orientation='h', yanchor='bottom', y=1.0),
-                                )
-                                st.plotly_chart(figg, use_container_width=True)
-
-                        # ---------- 설명 ----------
-                        with st.expander("❓ 이 알림은 어떻게 만들어지나요?"):
-                            st.markdown(
-                                "**1. 요일을 맞춰 비교합니다.**  \n"
-                                "빵집은 요일마다 판매량이 크게 다릅니다. 그래서 토요일은 직전 4주간의 "
-                                "토요일 평균과만 비교합니다. 전체 평균과 비교하면 멀쩡한 주말이 매번 "
-                                "'이상'으로 잡힙니다.\n\n"
-                                "**2. 여러 방법으로 함께 확인합니다.**  \n"
-                                "하루 크게 튄 날, 며칠에 걸쳐 서서히 밀린 날, 요일 패턴 자체가 깨진 날은 "
-                                "각각 다른 방식으로 잡아야 놓치지 않습니다. 여러 방법이 함께 지목한 날만 "
-                                "알림으로 올립니다.\n\n"
-                                "**3. 20% 미만 차이는 걸러냅니다.**  \n"
-                                "통계적으로는 차이가 있어도 현장에서 의미 없는 수준이면 알림을 만들지 "
-                                "않습니다. 알림이 너무 잦으면 결국 아무도 안 보게 되기 때문입니다.\n\n"
-                                "**4. 원인을 두 갈래로 나눕니다.**  \n"
-                                "그 날 매장 전체 매출도 흔들렸다면 날씨·휴일 같은 바깥 요인일 가능성이 크고, "
-                                "그 품목만 흔들렸다면 진열·품질·경쟁 제품 등 품목 자체의 문제일 가능성이 큽니다."
-                            )
-
-        # 탭 4: SHAP 기여도 분석
-        with tab_shap:
-            st.subheader("🧮 SHAP 기여도 분석 (XAI)")
-            st.caption(
-                "예측치를 '기저치 + 이벤트별 기여도'로 분해합니다. 각 예측이 왜 그 값이 나왔는지 "
-                "품목·날짜 단위로 근거를 확인할 수 있습니다."
-            )
-            shap_file = st.file_uploader(
-                "이벤트 통합 데이터셋 CSV 업로드 (date, item, sales_qty, 이벤트·기온 컬럼 포함)",
-                type=['csv'], key='shap_csv'
-            )
-
-            if shap_file is None and SAMPLE_DATA_PATH.exists():
-
-                if st.checkbox('동봉된 예시 데이터로 둘러보기', key='shap_sample'):
-
-                    shap_file = str(SAMPLE_DATA_PATH)
-
-
-            if shap_file is not None:
-                sdf = load_event_dataset(shap_file)
-                required_cols = {'date', 'item', 'sales_qty', 'is_weekend', 'is_holiday',
-                                  'is_vacation', 'season_period', 'precip_type', 'temperature'}
-                missing_cols = required_cols - set(sdf.columns)
-
-                if missing_cols:
-                    st.error(f"필수 컬럼이 없습니다: {', '.join(sorted(missing_cols))}")
-                elif not ML_AVAILABLE:
-                    st.warning("scikit-learn이 설치되어 있지 않아 모델을 학습할 수 없습니다.")
-                elif not SHAP_AVAILABLE:
-                    st.warning("shap이 설치되어 있지 않습니다. `pip install shap` 후 이용할 수 있습니다.")
-                else:
-                    shap_items = sorted(sdf['item'].unique())
-                    shap_item = st.selectbox("품목 선택", shap_items, key='shap_item')
-                    shap_horizon = st.slider("SHAP 분석 대상 기간(최근 N일)", 7, 60, 14, key='shap_horizon')
-
-                    item_daily = sdf[sdf['item'] == shap_item].groupby('date').agg(
-                        sales_qty=('sales_qty', 'sum'),
-                        is_weekend=('is_weekend', 'first'),
-                        is_holiday=('is_holiday', 'first'),
-                        is_vacation=('is_vacation', 'first'),
-                        season_period=('season_period', 'first'),
-                        precip_type=('precip_type', 'first'),
-                        temperature=('temperature', 'first'),
-                    ).sort_index().asfreq('D')
-                    item_daily['sales_qty'] = item_daily['sales_qty'].fillna(0.0)
-                    item_daily = item_daily.ffill()
-
-                    if len(item_daily) < shap_horizon + 60:
-                        st.warning("모델 학습에 필요한 데이터(최소 60일 + 분석기간)가 부족합니다.")
-                    else:
-                        X = build_shap_features(item_daily)
-                        y = item_daily['sales_qty']
-
-                        X_train, X_test = X.iloc[:-shap_horizon], X.iloc[-shap_horizon:]
-                        y_train, y_test = y.iloc[:-shap_horizon], y.iloc[-shap_horizon:]
-
-                        with st.spinner("모델 학습 및 SHAP 값 계산 중..."):
-                            model = train_shap_model(X_train, y_train)
-                            shap_values, base_value = explain_with_shap(model, X_test)
-                            pred_test = model.predict(X_test)
-
-                        st.markdown("#### 전역 특징 중요도 (평균 |SHAP|)")
-                        importance = pd.Series(
-                            np.abs(shap_values).mean(axis=0), index=X.columns
-                        ).sort_values(ascending=True)
-                        importance.index = [SHAP_LABELS.get(c, c) for c in importance.index]
-                        fig6a = px.bar(
-                            importance, orientation='h',
-                            labels={'value': '평균 |SHAP| (판매량 영향력)', 'index': '피처'},
-                            title=f"'{shap_item}' 예측에 대한 피처별 평균 기여도"
-                        )
-                        st.plotly_chart(fig6a, use_container_width=True)
-
-                        st.markdown("#### 날짜별 예측 분해")
-                        sel_date = st.selectbox(
-                            "날짜 선택", list(X_test.index), key='shap_date',
-                            format_func=lambda d: d.strftime('%Y-%m-%d (%a)')
-                        )
-                        idx = list(X_test.index).index(sel_date)
-                        contribs = pd.Series(shap_values[idx], index=X.columns)
-                        pred = pred_test[idx]
-                        actual = y_test.iloc[idx]
-
-                        briefing = format_shap_briefing(
-                            shap_item, sel_date.strftime('%Y-%m-%d'), base_value, contribs, pred, actual
-                        )
-                        st.chat_message("assistant").write(briefing)
-
-                        contrib_df = pd.DataFrame({
-                            '피처': [SHAP_LABELS.get(c, c) for c in contribs.index],
-                            'SHAP 기여도': contribs.values,
-                        })
-                        contrib_df = contrib_df.reindex(
-                            contrib_df['SHAP 기여도'].abs().sort_values(ascending=False).index
-                        )
-                        fig6b = px.bar(
-                            contrib_df, x='SHAP 기여도', y='피처', orientation='h',
-                            color='SHAP 기여도', color_continuous_scale='RdBu', color_continuous_midpoint=0,
-                            title=f"{sel_date.strftime('%Y-%m-%d')} 예측 기여도 분해 (기저 {base_value:.1f}개)"
-                        )
-                        st.plotly_chart(fig6b, use_container_width=True)
-
-                        with st.expander("📋 기여도 상세 표"):
-                            st.dataframe(contrib_df, use_container_width=True, hide_index=True)
-                            st.caption(
-                                f"검증: 기저치({base_value:.1f}) + 전체 기여도 합({contribs.sum():.1f}) "
-                                f"= 모델 예측치({pred:.1f})"
-                            )
-            else:
-                st.info("👈 이벤트 통합 데이터셋 CSV를 업로드하면 SHAP 기여도 분석을 실행할 수 있습니다.")
-
-        # 탭 5: What-if 채팅
-        with tab_whatif:
-            st.subheader("💬 What-if 채팅 — 이벤트 조건별 예상 판매량")
-            st.caption(
-                "이벤트 조건(비·눈·공휴일·방학·시즌)을 체크하면 예상 판매량과 권장 생산량이 "
-                "바로 바뀝니다. 문장으로 묻고 싶으면 아래 채팅을 쓰세요. "
-                "※ 채팅 문구는 키워드 매칭으로 조건을 인식합니다(LLM 미연동, 계산값은 실제 모델 결과)."
-            )
-            whatif_file = st.file_uploader(
-                "이벤트 통합 데이터셋 CSV 업로드 (date, item, sales_qty, 이벤트 컬럼 포함)",
-                type=['csv'], key='whatif_csv'
-            )
-
-            if whatif_file is None and SAMPLE_DATA_PATH.exists():
-
-                if st.checkbox('동봉된 예시 데이터로 둘러보기', key='whatif_sample'):
-
-                    whatif_file = str(SAMPLE_DATA_PATH)
-
-
-            if whatif_file is not None:
-                wdf = load_event_dataset(whatif_file)
-                required_cols = {'date', 'item', 'sales_qty', 'is_weekend', 'is_holiday',
-                                  'is_vacation', 'season_period', 'precip_type'}
-                missing_cols = required_cols - set(wdf.columns)
-
-                if missing_cols:
-                    st.error(f"필수 컬럼이 없습니다: {', '.join(sorted(missing_cols))}")
-                elif not ML_AVAILABLE:
-                    st.warning("scikit-learn이 설치되어 있지 않아 이벤트 탄력도를 추정할 수 없습니다.")
-                else:
-                    wi_item = st.selectbox("대상 품목", sorted(wdf['item'].unique()), key='whatif_item')
-
-                    item_daily = wdf[wdf['item'] == wi_item].groupby('date').agg(
-                        sales_qty=('sales_qty', 'sum'),
-                        is_weekend=('is_weekend', 'first'),
-                        is_holiday=('is_holiday', 'first'),
-                        is_vacation=('is_vacation', 'first'),
-                        season_period=('season_period', 'first'),
-                        precip_type=('precip_type', 'first'),
-                    ).sort_index().asfreq('D')
-                    item_daily['sales_qty'] = item_daily['sales_qty'].fillna(0.0)
-                    item_daily = item_daily.ffill()
-
-                    if len(item_daily) < 30:
-                        st.warning("모델 학습에 필요한 데이터(최소 30일)가 부족합니다.")
-                    else:
-                        events_full = build_event_dummies(item_daily)
-                        beta = fit_event_elasticity(item_daily['sales_qty'], events_full)
-                        base_forecast = float(np.clip(
-                            predict_holt_trend(item_daily['sales_qty'].values, 1)[0], 0, None
-                        ))
-
-                        st.markdown("##### 🔧 이벤트 조건 선택")
-                        st.caption("체크하면 아래 결과가 **바로** 바뀝니다. 채팅은 문장으로 묻고 싶을 때 쓰세요.")
-                        c1, c2, c3, c4 = st.columns(4)
-                        with c1:
-                            chk_rain = st.checkbox("🌧 비", key='wi_rain')
-                            chk_snow = st.checkbox("❄ 눈", key='wi_snow')
-                        with c2:
-                            chk_holiday = st.checkbox("🎌 공휴일", key='wi_holiday')
-                            chk_weekend = st.checkbox("📅 주말", key='wi_weekend')
-                        with c3:
-                            chk_vacation = st.checkbox("🏫 방학", key='wi_vacation')
-                        with c4:
-                            season_choice = st.selectbox(
-                                "시즌", ['없음', '크리스마스', '수능', '밸런타인', '추석'], key='wi_season'
-                            )
-                        tau_wi = st.slider(
-                            "게이팅 임계치 τ", 0.0, 0.3, 0.10, 0.01, key='wi_tau',
-                            help="이벤트 영향이 이 값보다 작으면 무시하고 기저 예측을 씁니다. "
-                                 "약한 이벤트까지 매번 반영하면 오히려 예측이 흔들리기 때문입니다. "
-                                 "0으로 두면 모든 이벤트를 반영합니다."
-                        )
-
-                        def whatif_events(flags=None):
-                            """체크박스 상태(+선택적으로 채팅에서 읽은 조건)를 합쳐 이벤트 벡터를 만든다."""
-                            f = flags or {k: False for k in WHATIF_KEYWORD_MAP}
-                            return {
-                                'is_weekend': float(chk_weekend or f['is_weekend']),
-                                'is_holiday': float(chk_holiday or f['is_holiday']),
-                                'is_vacation': float(chk_vacation or f['is_vacation']),
-                                'is_rain': float(chk_rain or f['is_rain']),
-                                'is_snow': float(chk_snow or f['is_snow']),
-                                'is_christmas': float(season_choice == '크리스마스' or f['is_christmas']),
-                                'is_suneung': float(season_choice == '수능' or f['is_suneung']),
-                                'is_valentine': float(season_choice == '밸런타인' or f['is_valentine']),
-                                'is_chuseok': float(season_choice == '추석' or f['is_chuseok']),
-                            }
-
-                        # ---------- 즉시 결과 ----------
-                        # 체크박스를 건드리는 순간 바로 보이도록, 채팅과 무관하게 항상 계산해 띄운다.
-                        live_events = whatif_events()
-                        live = whatif_compute(beta, base_forecast, live_events, tau_wi)
-                        live_active = [SHAP_LABELS.get(k, k) for k, v in live_events.items() if v]
-
-                        st.markdown("---")
-                        r1, r2, r3 = st.columns(3)
-                        r1.metric("기저 예측 (이벤트 없음)", f"{base_forecast:.0f}개")
-                        r2.metric("조건 반영 예상 판매량", f"{live['final']:.0f}개",
-                                  delta=f"{live['pct']:+.1f}%")
-                        r3.metric("권장 생산량 (안전재고 10%)", f"{live['production']}개")
-
-                        if not live_active:
-                            st.caption("위에서 조건을 체크하면 예상 판매량이 어떻게 달라지는지 바로 보여드립니다.")
-                        else:
-                            st.caption(f"선택한 조건: {', '.join(live_active)}")
-
-                            # 어떤 이벤트가 얼마나 밀어올리고 끌어내렸는지 보여준다.
-                            # 이게 없으면 "비를 켰는데 숫자가 그대로"인 이유를 알 수 없다.
-                            contrib_rows = [
-                                {'조건': SHAP_LABELS.get(k, k),
-                                 '판매량 영향': f"{v * 100:+.1f}%"}
-                                for k, v in sorted(live['contribs'].items(),
-                                                    key=lambda kv: -abs(kv[1]))
-                            ]
-                            cc1, cc2 = st.columns([1, 1.3])
-                            with cc1:
-                                st.dataframe(pd.DataFrame(contrib_rows),
-                                              use_container_width=True, hide_index=True)
-                            with cc2:
-                                if live['gate_on']:
-                                    st.success(
-                                        f"이벤트 강도 합계 **{live['score']:+.2f}** 가 임계치 "
-                                        f"τ={tau_wi:.2f} 이상이라 예측에 반영했습니다."
-                                    )
-                                else:
-                                    st.warning(
-                                        f"이벤트 강도 합계 **{live['score']:+.2f}** 가 임계치 "
-                                        f"τ={tau_wi:.2f} 보다 작아 **반영하지 않았습니다.** "
-                                        f"그래서 위 숫자가 기저 예측과 같습니다.\n\n"
-                                        f"영향이 작다고 판단한 것이므로 정상 동작입니다. "
-                                        f"그래도 반영해 보고 싶으면 **τ를 "
-                                        f"{max(abs(live['score']) - 0.01, 0.0):.2f} 이하로** 내려보세요."
-                                    )
-
-                        # ---------- 채팅 ----------
-                        st.markdown("---")
-                        st.markdown("##### 💬 문장으로 물어보기")
-
-                        if 'whatif_messages' not in st.session_state:
-                            st.session_state.whatif_messages = []
-
-                        if st.button("🗑 대화 초기화", key='whatif_clear'):
-                            st.session_state.whatif_messages = []
-                            st.rerun()
-
-                        for msg in st.session_state.whatif_messages:
-                            st.chat_message(msg['role']).write(msg['content'])
-
-                        user_text = st.chat_input(
-                            f"'{wi_item}'에 대해 물어보세요 (예: 내일 비 오고 방학이면?)"
-                        )
-                        if user_text:
-                            st.session_state.whatif_messages.append({'role': 'user', 'content': user_text})
-                            text_flags = parse_events_llm(user_text)
-                            if text_flags is None:
-                                text_flags = parse_whatif_keywords(user_text)
-
-                            events = whatif_events(text_flags)
-                            r = whatif_compute(beta, base_forecast, events, tau_wi)
-                            active = [SHAP_LABELS.get(k, k) for k, v in events.items() if v]
-                            cond_str = ', '.join(active) if active else '특별한 이벤트 없음'
-                            reply = whatif_reply_text(wi_item, cond_str, base_forecast, r, tau_wi)
-
-                            ctx = {
-                                'item': wi_item,
-                                'cond_str': cond_str,
-                                'base': base_forecast,
-                                'final': r['final'],
-                                'pct': r['pct'],
-                                'production': r['production'],
-                                'score': r['score'],
-                                'tau': tau_wi,
-                                'gate': '발동' if r['gate_on'] else '미발동',
-                            }
-
-                            with st.chat_message('user'):
-                                st.markdown(user_text)
-
-                            with st.chat_message('assistant'):
-                                try:
-                                    streamed = st.write_stream(stream_reply(ctx))
-                                except Exception as e:
-                                    print(f"[whatif_llm] 스트리밍 실패: {e}")
-                                    streamed = None
-
-                                if not streamed:
-                                    st.markdown(reply)
-                                    streamed = reply
-
-                            st.session_state.whatif_messages.append(
-                                {'role': 'assistant', 'content': streamed}
-                            )
-            else:
-                st.info("👈 이벤트 통합 데이터셋 CSV를 업로드하면 What-if 채팅을 사용할 수 있습니다.")
-
-        # 탭 6: 이벤트 우선 게이팅(H1) 검증 — 개발자 전용, 맨 뒤에 배치
-        with tab_h1:
-            st.error(
-                "⚙️ **개발자 전용 탭입니다.** 모델이 제대로 동작하는지 검증하는 화면이라 "
-                "매장 운영에는 필요하지 않습니다. 그냥 지나치셔도 됩니다."
-            )
-            st.subheader("🌦 이벤트 우선 게이팅 (Layer 2, H1) — Walk-forward 백테스트")
-            st.caption(
-                "공휴일·방학·시즌·날씨 이벤트를 반영한 예측이, 이벤트를 무시한 기저 시계열 예측보다 "
-                "실제로 더 정확한지 최근 기간을 떼어내 검증합니다 (가설 H1). "
-                "미래 이벤트는 알 수 없으므로 '미래 예측'이 아니라 과거 데이터로 백테스트합니다."
-            )
-            event_file = st.file_uploader(
-                "이벤트 통합 데이터셋 CSV 업로드 (date, item, sales_qty, is_weekend, is_holiday, "
-                "is_vacation, season_period, precip_type 컬럼 포함)",
-                type=['csv'], key='event_csv'
-            )
-
-            if event_file is None and SAMPLE_DATA_PATH.exists():
-
-                if st.checkbox('동봉된 예시 데이터로 둘러보기', key='event_sample'):
-
-                    event_file = str(SAMPLE_DATA_PATH)
-
-
-            if event_file is not None:
-                edf = load_event_dataset(event_file)
-                required_cols = {'date', 'item', 'sales_qty', 'is_weekend', 'is_holiday',
-                                  'is_vacation', 'season_period', 'precip_type'}
-                missing_cols = required_cols - set(edf.columns)
-
-                if missing_cols:
-                    st.error(f"필수 컬럼이 없습니다: {', '.join(sorted(missing_cols))}")
-                elif not ML_AVAILABLE:
-                    st.warning("scikit-learn이 설치되어 있지 않아 이벤트 탄력도를 추정할 수 없습니다.")
-                else:
-                    ev_items = sorted(edf['item'].unique())
-                    ev_item = st.selectbox("품목 선택", ev_items, key='event_item')
-                    horizon = st.slider("백테스트 검증 기간(일)", 7, 28, 14, key='event_horizon')
-                    tau = st.slider(
-                        "이벤트 게이팅 임계치 τ (이 값을 넘는 이벤트 강도만 예측에 반영)",
-                        0.0, 0.3, 0.10, 0.01, key='event_tau'
-                    )
-
-                    item_daily = edf[edf['item'] == ev_item].groupby('date').agg(
-                        sales_qty=('sales_qty', 'sum'),
-                        is_weekend=('is_weekend', 'first'),
-                        is_holiday=('is_holiday', 'first'),
-                        is_vacation=('is_vacation', 'first'),
-                        season_period=('season_period', 'first'),
-                        precip_type=('precip_type', 'first'),
-                    ).sort_index()
-
-                    if len(item_daily) < horizon + 30:
-                        st.warning("검증에 필요한 데이터(최소 학습 30일 + 검증기간)가 부족합니다.")
-                    else:
-                        train = item_daily.iloc[:-horizon]
-                        test = item_daily.iloc[-horizon:]
-
-                        events = build_event_dummies(item_daily)
-                        beta = fit_event_elasticity(train['sales_qty'], events.loc[train.index])
-
-                        base_fc = predict_prophet(train['sales_qty'], horizon, freq='D')
-                        base_fc = np.clip(base_fc, 0, None)
-
-                        # Layer 2 본선: 이벤트를 Prophet 회귀변수로 기저모델에 직접 투입
-                        event_fc = predict_prophet_with_events(
-                            train['sales_qty'], events.loc[train.index], events.loc[test.index], freq='D'
-                        )
-                        event_fc = np.clip(event_fc, 0, None)
-
-                        # 대조군(ablation): 기존 곱셈형 사후 게이팅
-                        gated_fc, event_score, gate_on = apply_event_gating(
-                            base_fc, beta, events.loc[test.index], tau
-                        )
-
-                        actual = test['sales_qty'].values
-                        wape_base = compute_wape(actual, base_fc)
-                        wape_event = compute_wape(actual, event_fc)
-                        wape_gated = compute_wape(actual, gated_fc)
-
-                        m1, m2, m3, m4 = st.columns(4)
-                        m1.metric("기저 예측(Layer 1) WAPE", f"{wape_base:.1f}%")
-                        m2.metric("이벤트 회귀(H1) WAPE", f"{wape_event:.1f}%",
-                                  delta=f"{wape_event - wape_base:+.1f}%p", delta_color="inverse")
-                        m3.metric("곱셈형 게이팅(대조군) WAPE", f"{wape_gated:.1f}%",
-                                  delta=f"{wape_gated - wape_base:+.1f}%p", delta_color="inverse")
-                        m4.metric("게이팅 발동 일수", f"{int(gate_on.sum())} / {horizon}일")
-
-                        if wape_event < wape_base:
-                            st.success(
-                                f"H1 지지: '{ev_item}'은 이벤트를 기저모델 회귀변수로 반영했을 때 "
-                                f"WAPE가 {wape_base - wape_event:.1f}%p 개선됐습니다."
-                            )
-                        else:
-                            st.warning(
-                                f"H1 미지지: '{ev_item}'은 이번 검증 기간에서 이벤트 반영이 오히려 "
-                                f"WAPE를 {wape_event - wape_base:.1f}%p 악화시켰습니다."
-                            )
-
+                    n_event = sum(1 for a in alerts if a['is_event'])
+                    if n_event:
                         st.caption(
-                            "※ '곱셈형 게이팅'은 기존 융합식 ŷ_base×(1+Σβₖeₖ)를 그대로 둔 **대조군(ablation)**입니다. "
-                            "Prophet이 주간 계절성으로 이미 학습한 주말 효과를 β_weekend(+0.35~+0.43)로 한 번 더 "
-                            "곱해 이벤트를 이중 계상하기 때문에, 기저보다 나빠지는 것이 정상입니다. "
-                            "본선은 이중계상이 구조적으로 없는 '이벤트 회귀' 쪽입니다."
+                            f"이 가운데 {n_event}건은 시즌, 공휴일, 날씨로 설명되는 날입니다. "
+                            "**원인을 알 수 없는 날을 먼저** 보여드립니다."
                         )
+                    elif n_high:
+                        st.caption(f"특히 눈여겨볼 것 {n_high}건을 맨 위에 두었습니다.")
 
-                        fig3 = go.Figure()
-                        fig3.add_trace(go.Scatter(x=test.index, y=actual, name='실제',
-                                                   line=dict(color='black', width=3)))
-                        fig3.add_trace(go.Scatter(x=test.index, y=base_fc, name='기저 예측(Layer 1)',
-                                                   line=dict(color='blue', dash='dot')))
-                        fig3.add_trace(go.Scatter(x=test.index, y=event_fc, name='이벤트 회귀 예측(H1)',
-                                                   line=dict(color='red', width=3)))
-                        fig3.add_trace(go.Scatter(x=test.index, y=gated_fc, name='곱셈형 게이팅(대조군)',
-                                                   line=dict(color='gray', dash='dash', width=1.5)))
-                        for d, on in zip(test.index, gate_on):
-                            if on:
-                                fig3.add_vrect(x0=d - pd.Timedelta(hours=12), x1=d + pd.Timedelta(hours=12),
-                                               fillcolor='orange', opacity=0.15, line_width=0)
-                        fig3.update_layout(
-                            height=450, hovermode='x unified',
-                            title=f"{ev_item} — 이벤트 게이팅 백테스트 (주황 음영 = 게이팅 발동일)"
+                    show_items = st.multiselect(
+                        "품목으로 좁혀보기 (비워두면 전체)",
+                        sorted({a['item'] for a in alerts}), key='alert_filter'
+                    )
+                    shown = [a for a in alerts if not show_items or a['item'] in show_items]
+
+                    for a in shown[:20]:
+                        with st.container(border=True):
+                            if a['is_event']:
+                                tag = '이유를 아는 날'
+                            else:
+                                tag = {'높음': '눈여겨보세요',
+                                       '보통': '참고하세요',
+                                       '낮음': '가벼운 차이'}[a['severity']]
+                            st.markdown(f"**{a['headline']}**")
+                            st.caption(f"{tag}, {a['detail']}")
+                            st.markdown(f"{a['meaning']} {a['action']}")
+                            if a['cause']:
+                                st.caption(a['cause'])
+
+                    if len(shown) > 20:
+                        st.caption(f"이 밖에 {len(shown) - 20}건이 더 있습니다.")
+
+                # ---------- 2. 요즘 추세 ----------
+                st.markdown("### 요즘 잘 나가고 있나요?")
+                st.caption("하루 튄 것보다 **몇 주에 걸친 변화**가 발주량 조정에 더 중요합니다.")
+
+                trend_rows = []
+                for it, t in trends.items():
+                    if t is None:
+                        continue
+                    trend_rows.append({
+                        '품목': it,
+                        '방향': ('늘고 있음' if t['direction'] == '상승' else '줄고 있음'),
+                        '최근 4주 변화': f"{t['change'] * 100:+.0f}%",
+                        '이렇게 해보세요': t['action'],
+                    })
+
+                if trend_rows:
+                    trend_df = pd.DataFrame(trend_rows).sort_values(
+                        '최근 4주 변화',
+                        key=lambda s: s.str.rstrip('%').astype(float),
+                        ascending=False,
+                    )
+                    st.dataframe(trend_df, width='stretch', hide_index=True)
+                else:
+                    st.info("최근 4주간 뚜렷하게 늘거나 줄어든 품목이 없습니다.")
+
+                # ---------- 3. 요일별 준비량 ----------
+                st.markdown("### 요일별 준비량 가이드")
+                st.caption("최근 4주 실적을 요일별로 모은 표입니다. 내일 몇 개 준비할지 정할 때 쓰세요.")
+
+                guide_item = st.selectbox("품목 선택", all_items, key='guide_item')
+                guide = weekday_guide(by_item[guide_item])
+
+                if guide is None:
+                    st.info("이 품목은 데이터가 부족해 요일별 가이드를 만들 수 없습니다.")
+                else:
+                    gc1, gc2 = st.columns([1, 1.4])
+                    with gc1:
+                        st.dataframe(guide, width='stretch', hide_index=True)
+                        st.caption(
+                            "**권장 준비량**은 평균보다 10% 여유를 둔 값입니다. "
+                            "품절보다 약간의 여유가 낫다는 기준이며, 폐기가 부담되면 평균에 맞추세요."
                         )
-                        st.plotly_chart(fig3, use_container_width=True)
+                    with gc2:
+                        # 최근 60일 판매 흐름 + 평소 범위
+                        s = by_item[guide_item].tail(60)
+                        _, exp = weekday_residual(by_item[guide_item])
+                        exp = exp.reindex(s.index)
 
-                        with st.expander("📊 추정된 이벤트 탄력도(β) 보기"):
-                            beta_df = pd.DataFrame({'이벤트': list(beta.keys()), '탄력도(β)': list(beta.values())})
-                            beta_df = beta_df.reindex(
-                                beta_df['탄력도(β)'].abs().sort_values(ascending=False).index
-                            )
-                            st.dataframe(beta_df, use_container_width=True, hide_index=True)
-                            st.caption("β > 0: 해당 이벤트일 때 판매량 증가 경향 / β < 0: 감소 경향 "
-                                       "(학습 구간 기준 선형회귀 추정치, Σβₖ·eₖ가 이벤트 강도 점수)")
+                        figg = go.Figure()
+                        figg.add_trace(go.Scatter(
+                            x=s.index, y=exp * 1.3, name='평소 범위(위)',
+                            line=dict(width=0), showlegend=False, hoverinfo='skip'))
+                        figg.add_trace(go.Scatter(
+                            x=s.index, y=exp * 0.7, name='평소 범위',
+                            line=dict(width=0), fill='tonexty',
+                            fillcolor='rgba(120,170,220,0.18)', hoverinfo='skip'))
+                        figg.add_trace(go.Scatter(
+                            x=s.index, y=s, name='실제 판매량',
+                            line=dict(color='#2C3E50', width=2)))
+
+                        hit_dates = [a['date'] for a in alerts if a['item'] == guide_item
+                                     and a['date'] in s.index]
+                        if hit_dates:
+                            figg.add_trace(go.Scatter(
+                                x=hit_dates, y=s.loc[hit_dates], mode='markers',
+                                name='평소와 달랐던 날',
+                                marker=dict(color='#E74C3C', size=10, symbol='circle')))
+
+                        figg.update_layout(
+                            height=330, hovermode='x unified',
+                            title=f"{guide_item} - 최근 60일",
+                            margin=dict(t=45, b=30, l=10, r=10),
+                            legend=dict(orientation='h', yanchor='bottom', y=1.0),
+                        )
+                        st.plotly_chart(figg, width='stretch')
+
+                # ---------- 설명 ----------
+                with st.expander("이 알림은 어떻게 만들어지나요?"):
+                    st.markdown(
+                        "**1. 요일을 맞춰 비교합니다.**  \n"
+                        "빵집은 요일마다 판매량이 크게 다릅니다. 그래서 토요일은 직전 4주간의 "
+                        "토요일 평균과만 비교합니다. 전체 평균과 비교하면 멀쩡한 주말이 매번 "
+                        "'이상'으로 잡힙니다.\n\n"
+                        "**2. 여러 방법으로 함께 확인합니다.**  \n"
+                        "하루 크게 튄 날, 며칠에 걸쳐 서서히 밀린 날, 요일 패턴 자체가 깨진 날은 "
+                        "각각 다른 방식으로 잡아야 놓치지 않습니다. 여러 방법이 함께 지목한 날만 "
+                        "알림으로 올립니다.\n\n"
+                        "**3. 20% 미만 차이는 걸러냅니다.**  \n"
+                        "통계적으로는 차이가 있어도 현장에서 의미 없는 수준이면 알림을 만들지 "
+                        "않습니다. 알림이 너무 잦으면 결국 아무도 안 보게 되기 때문입니다.\n\n"
+                        "**4. 원인을 두 갈래로 나눕니다.**  \n"
+                        "그 날 매장 전체 매출도 흔들렸다면 날씨, 휴일 같은 바깥 요인일 가능성이 크고, "
+                        "그 품목만 흔들렸다면 진열, 품질, 경쟁 제품 등 품목 자체의 문제일 가능성이 큽니다."
+                    )
+
+# 탭 4: SHAP 기여도 분석
+with tab_shap:
+    st.subheader("SHAP 기여도 분석 (XAI)")
+    st.caption(
+        "예측치를 '기저치 + 이벤트별 기여도'로 분해합니다. 각 예측이 왜 그 값이 나왔는지 "
+        "품목, 날짜 단위로 근거를 확인할 수 있습니다."
+    )
+    shap_file = st.file_uploader(
+        "이벤트 통합 데이터셋 CSV 업로드 (date, item, sales_qty, 이벤트, 기온 컬럼 포함)",
+        type=['csv'], key='shap_csv'
+    )
+
+    if shap_file is None and SAMPLE_DATA_PATH.exists():
+
+        if st.checkbox('동봉된 예시 데이터로 둘러보기', key='shap_sample'):
+
+            shap_file = str(SAMPLE_DATA_PATH)
+
+
+    if shap_file is not None:
+        sdf = load_event_dataset(shap_file)
+        required_cols = {'date', 'item', 'sales_qty', 'is_weekend', 'is_holiday',
+                          'is_vacation', 'season_period', 'precip_type', 'temperature'}
+        missing_cols = required_cols - set(sdf.columns)
+
+        if missing_cols:
+            st.error(f"필수 컬럼이 없습니다: {', '.join(sorted(missing_cols))}")
+        elif not ML_AVAILABLE:
+            st.warning("scikit-learn이 설치되어 있지 않아 모델을 학습할 수 없습니다.")
+        elif not SHAP_AVAILABLE:
+            st.warning("shap이 설치되어 있지 않습니다. `pip install shap` 후 이용할 수 있습니다.")
+        else:
+            shap_items = sorted(sdf['item'].unique())
+            shap_item = st.selectbox("품목 선택", shap_items, key='shap_item')
+            shap_horizon = st.slider("SHAP 분석 대상 기간(최근 N일)", 7, 60, 14, key='shap_horizon')
+
+            item_daily = sdf[sdf['item'] == shap_item].groupby('date').agg(
+                sales_qty=('sales_qty', 'sum'),
+                is_weekend=('is_weekend', 'first'),
+                is_holiday=('is_holiday', 'first'),
+                is_vacation=('is_vacation', 'first'),
+                season_period=('season_period', 'first'),
+                precip_type=('precip_type', 'first'),
+                temperature=('temperature', 'first'),
+            ).sort_index().asfreq('D')
+            item_daily['sales_qty'] = item_daily['sales_qty'].fillna(0.0)
+            item_daily = item_daily.ffill()
+
+            if len(item_daily) < shap_horizon + 60:
+                st.warning("모델 학습에 필요한 데이터(최소 60일 + 분석기간)가 부족합니다.")
             else:
-                st.info("👈 방학·공휴일·날씨·시즌 이벤트가 포함된 통합 데이터셋 CSV를 업로드하면 H1 가설을 검증할 수 있습니다.")
+                X = build_shap_features(item_daily)
+                y = item_daily['sales_qty']
+
+                X_train, X_test = X.iloc[:-shap_horizon], X.iloc[-shap_horizon:]
+                y_train, y_test = y.iloc[:-shap_horizon], y.iloc[-shap_horizon:]
+
+                with st.spinner("모델 학습 및 SHAP 값 계산 중..."):
+                    model = train_shap_model(X_train, y_train)
+                    shap_values, base_value = explain_with_shap(model, X_test)
+                    pred_test = model.predict(X_test)
+
+                st.markdown("#### 전역 특징 중요도 (평균 |SHAP|)")
+                importance = pd.Series(
+                    np.abs(shap_values).mean(axis=0), index=X.columns
+                ).sort_values(ascending=True)
+                importance.index = [SHAP_LABELS.get(c, c) for c in importance.index]
+                fig6a = px.bar(
+                    importance, orientation='h',
+                    labels={'value': '평균 |SHAP| (판매량 영향력)', 'index': '피처'},
+                    title=f"'{shap_item}' 예측에 대한 피처별 평균 기여도"
+                )
+                st.plotly_chart(fig6a, width='stretch')
+
+                st.markdown("#### 날짜별 예측 분해")
+                sel_date = st.selectbox(
+                    "날짜 선택", list(X_test.index), key='shap_date',
+                    format_func=lambda d: d.strftime('%Y-%m-%d (%a)')
+                )
+                idx = list(X_test.index).index(sel_date)
+                contribs = pd.Series(shap_values[idx], index=X.columns)
+                pred = pred_test[idx]
+                actual = y_test.iloc[idx]
+
+                briefing = format_shap_briefing(
+                    shap_item, sel_date.strftime('%Y-%m-%d'), base_value, contribs, pred, actual
+                )
+                st.chat_message("assistant").write(briefing)
+
+                contrib_df = pd.DataFrame({
+                    '피처': [SHAP_LABELS.get(c, c) for c in contribs.index],
+                    'SHAP 기여도': contribs.values,
+                })
+                contrib_df = contrib_df.reindex(
+                    contrib_df['SHAP 기여도'].abs().sort_values(ascending=False).index
+                )
+                fig6b = px.bar(
+                    contrib_df, x='SHAP 기여도', y='피처', orientation='h',
+                    color='SHAP 기여도', color_continuous_scale='RdBu', color_continuous_midpoint=0,
+                    title=f"{sel_date.strftime('%Y-%m-%d')} 예측 기여도 분해 (기저 {base_value:.1f}개)"
+                )
+                st.plotly_chart(fig6b, width='stretch')
+
+                with st.expander("기여도 상세 표"):
+                    st.dataframe(contrib_df, width='stretch', hide_index=True)
+                    st.caption(
+                        f"검증: 기저치({base_value:.1f}) + 전체 기여도 합({contribs.sum():.1f}) "
+                        f"= 모델 예측치({pred:.1f})"
+                    )
+    else:
+        st.info("이벤트 통합 데이터셋 CSV를 업로드하면 SHAP 기여도 분석을 실행할 수 있습니다.")
+
+# 탭 6: 이벤트 우선 게이팅(H1) 검증 - 개발자 전용, 맨 뒤에 배치
+with tab_h1:
+    st.error(
+        "**개발자 전용 탭입니다.** 모델이 제대로 동작하는지 검증하는 화면이라 "
+        "매장 운영에는 필요하지 않습니다. 그냥 지나치셔도 됩니다."
+    )
+    st.subheader("이벤트 우선 게이팅 (Layer 2, H1) - Walk-forward 백테스트")
+    st.caption(
+        "공휴일, 방학, 시즌, 날씨 이벤트를 반영한 예측이, 이벤트를 무시한 기저 시계열 예측보다 "
+        "실제로 더 정확한지 최근 기간을 떼어내 검증합니다 (가설 H1). "
+        "미래 이벤트는 알 수 없으므로 '미래 예측'이 아니라 과거 데이터로 백테스트합니다."
+    )
+    event_file = st.file_uploader(
+        "이벤트 통합 데이터셋 CSV 업로드 (date, item, sales_qty, is_weekend, is_holiday, "
+        "is_vacation, season_period, precip_type 컬럼 포함)",
+        type=['csv'], key='event_csv'
+    )
+
+    if event_file is None and SAMPLE_DATA_PATH.exists():
+
+        if st.checkbox('동봉된 예시 데이터로 둘러보기', key='event_sample'):
+
+            event_file = str(SAMPLE_DATA_PATH)
 
 
+    if event_file is not None:
+        edf = load_event_dataset(event_file)
+        required_cols = {'date', 'item', 'sales_qty', 'is_weekend', 'is_holiday',
+                          'is_vacation', 'season_period', 'precip_type'}
+        missing_cols = required_cols - set(edf.columns)
 
-else:
-    st.info("👈 왼쪽 사이드바에서 빵집 판매내역 CSV 파일을 업로드해주세요.")
+        if missing_cols:
+            st.error(f"필수 컬럼이 없습니다: {', '.join(sorted(missing_cols))}")
+        elif not ML_AVAILABLE:
+            st.warning("scikit-learn이 설치되어 있지 않아 이벤트 탄력도를 추정할 수 없습니다.")
+        else:
+            ev_items = sorted(edf['item'].unique())
+            ev_item = st.selectbox("품목 선택", ev_items, key='event_item')
+            horizon = st.slider("백테스트 검증 기간(일)", 7, 28, 14, key='event_horizon')
+            tau = st.slider(
+                "이벤트 게이팅 임계치 tau (이 값을 넘는 이벤트 강도만 예측에 반영)",
+                0.0, 0.3, 0.10, 0.01, key='event_tau'
+            )
+
+            item_daily = edf[edf['item'] == ev_item].groupby('date').agg(
+                sales_qty=('sales_qty', 'sum'),
+                is_weekend=('is_weekend', 'first'),
+                is_holiday=('is_holiday', 'first'),
+                is_vacation=('is_vacation', 'first'),
+                season_period=('season_period', 'first'),
+                precip_type=('precip_type', 'first'),
+            ).sort_index()
+
+            if len(item_daily) < horizon + 30:
+                st.warning("검증에 필요한 데이터(최소 학습 30일 + 검증기간)가 부족합니다.")
+            else:
+                train = item_daily.iloc[:-horizon]
+                test = item_daily.iloc[-horizon:]
+
+                events = build_event_dummies(item_daily)
+                beta = fit_event_elasticity(train['sales_qty'], events.loc[train.index])
+
+                base_fc = predict_prophet(train['sales_qty'], horizon, freq='D')
+                base_fc = np.clip(base_fc, 0, None)
+
+                # Layer 2 본선: 이벤트를 Prophet 회귀변수로 기저모델에 직접 투입
+                event_fc = predict_prophet_with_events(
+                    train['sales_qty'], events.loc[train.index], events.loc[test.index], freq='D'
+                )
+                event_fc = np.clip(event_fc, 0, None)
+
+                # 대조군(ablation): 기존 곱셈형 사후 게이팅
+                gated_fc, event_score, gate_on = apply_event_gating(
+                    base_fc, beta, events.loc[test.index], tau
+                )
+
+                actual = test['sales_qty'].values
+                wape_base = compute_wape(actual, base_fc)
+                wape_event = compute_wape(actual, event_fc)
+                wape_gated = compute_wape(actual, gated_fc)
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("기저 예측(Layer 1) WAPE", f"{wape_base:.1f}%")
+                m2.metric("이벤트 회귀(H1) WAPE", f"{wape_event:.1f}%",
+                          delta=f"{wape_event - wape_base:+.1f}%p", delta_color="inverse")
+                m3.metric("곱셈형 게이팅(대조군) WAPE", f"{wape_gated:.1f}%",
+                          delta=f"{wape_gated - wape_base:+.1f}%p", delta_color="inverse")
+                m4.metric("게이팅 발동 일수", f"{int(gate_on.sum())} / {horizon}일")
+
+                if wape_event < wape_base:
+                    st.success(
+                        f"H1 지지: '{ev_item}'은 이벤트를 기저모델 회귀변수로 반영했을 때 "
+                        f"WAPE가 {wape_base - wape_event:.1f}%p 개선됐습니다."
+                    )
+                else:
+                    st.warning(
+                        f"H1 미지지: '{ev_item}'은 이번 검증 기간에서 이벤트 반영이 오히려 "
+                        f"WAPE를 {wape_event - wape_base:.1f}%p 악화시켰습니다."
+                    )
+
+                st.caption(
+                    "참고: '곱셈형 게이팅'은 기존 융합식 y_hat_basex(1+sumbeta_ke_k)를 그대로 둔 **대조군(ablation)**입니다. "
+                    "Prophet이 주간 계절성으로 이미 학습한 주말 효과를 beta_weekend(+0.35~+0.43)로 한 번 더 "
+                    "곱해 이벤트를 이중 계상하기 때문에, 기저보다 나빠지는 것이 정상입니다. "
+                    "본선은 이중계상이 구조적으로 없는 '이벤트 회귀' 쪽입니다."
+                )
+
+                fig3 = go.Figure()
+                fig3.add_trace(go.Scatter(x=test.index, y=actual, name='실제',
+                                           line=dict(color='black', width=3)))
+                fig3.add_trace(go.Scatter(x=test.index, y=base_fc, name='기저 예측(Layer 1)',
+                                           line=dict(color='blue', dash='dot')))
+                fig3.add_trace(go.Scatter(x=test.index, y=event_fc, name='이벤트 회귀 예측(H1)',
+                                           line=dict(color='red', width=3)))
+                fig3.add_trace(go.Scatter(x=test.index, y=gated_fc, name='곱셈형 게이팅(대조군)',
+                                           line=dict(color='gray', dash='dash', width=1.5)))
+                for d, on in zip(test.index, gate_on):
+                    if on:
+                        fig3.add_vrect(x0=d - pd.Timedelta(hours=12), x1=d + pd.Timedelta(hours=12),
+                                       fillcolor='orange', opacity=0.15, line_width=0)
+                fig3.update_layout(
+                    height=450, hovermode='x unified',
+                    title=f"{ev_item} - 이벤트 게이팅 백테스트 (주황 음영 = 게이팅 발동일)"
+                )
+                st.plotly_chart(fig3, width='stretch')
+
+                with st.expander("추정된 이벤트 탄력도(beta) 보기"):
+                    beta_df = pd.DataFrame({'이벤트': list(beta.keys()), '탄력도(beta)': list(beta.values())})
+                    beta_df = beta_df.reindex(
+                        beta_df['탄력도(beta)'].abs().sort_values(ascending=False).index
+                    )
+                    st.dataframe(beta_df, width='stretch', hide_index=True)
+                    st.caption("beta > 0: 해당 이벤트일 때 판매량 증가 경향 / beta < 0: 감소 경향 "
+                               "(학습 구간 기준 선형회귀 추정치, sumbeta_k, e_k가 이벤트 강도 점수)")
+    else:
+        st.info("방학, 공휴일, 날씨, 시즌 이벤트가 포함된 통합 데이터셋 CSV를 업로드하면 H1 가설을 검증할 수 있습니다.")

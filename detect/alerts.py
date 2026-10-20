@@ -2,13 +2,13 @@
 
 control_charts.py 는 '통계적으로 이상한가'를 판단하고, 이 파일은 그 결과를
 '그래서 재고를 어떻게 하라는 것인가'로 번역한다. 두 관심사를 파일로 갈라놓은 이유는
-화면에 3시그마·EWMA·CUSUM 같은 말이 한 글자도 나가지 않게 하기 위해서다.
+화면에 3시그마, EWMA, CUSUM 같은 말이 한 글자도 나가지 않게 하기 위해서다.
 
 번역 규칙
-    많이 팔린 날  -> 재고가 부족했을 수 있다  -> 품절 위험, 생산·발주 늘리기 검토
-    적게 팔린 날  -> 재고가 남았을 수 있다    -> 폐기 위험, 생산·발주 줄이기 검토
-    전체 매출도 같이 흔들림 -> 날씨·휴일 같은 바깥 요인일 가능성
-    이 품목만 흔들림        -> 진열·품질·경쟁 제품 등 그 품목의 문제일 가능성
+    많이 팔린 날  -> 재고가 부족했을 수 있다  -> 품절 위험, 생산, 발주 늘리기 검토
+    적게 팔린 날  -> 재고가 남았을 수 있다    -> 폐기 위험, 생산, 발주 줄이기 검토
+    전체 매출도 같이 흔들림 -> 날씨, 휴일 같은 바깥 요인일 가능성
+    이 품목만 흔들림        -> 진열, 품질, 경쟁 제품 등 그 품목의 문제일 가능성
 
 '평소'의 기준은 직전 4주간 같은 요일의 평균이다. 전체 평균이 아니라 같은 요일을
 쓰는 이유는, 빵집 판매량이 요일마다 크게 다르기 때문이다. 토요일 판매량을
@@ -34,12 +34,12 @@ def _josa(word, with_batchim, without_batchim):
         return without_batchim
     ch = word[-1]
     if not ("가" <= ch <= "힣"):
-        return without_batchim          # 영문·숫자로 끝나면 받침 없는 쪽으로
+        return without_batchim          # 영문, 숫자로 끝나면 받침 없는 쪽으로
     return with_batchim if (ord(ch) - 0xAC00) % 28 else without_batchim
 
 
 def build_context(df):
-    """날짜별 '그 날 무슨 날이었나'를 뽑아둔다 (시즌·공휴일·날씨).
+    """날짜별 '그 날 무슨 날이었나'를 뽑아둔다 (시즌, 공휴일, 날씨).
 
     이게 없으면 크리스마스 시즌 판매 급증이 그냥 '이상'으로만 뜬다. 소상공인 입장에서는
     예측 가능한 대목을 이상이라고 알려주는 셈이라 소음이 된다. 반대로 시즌을 붙여주면
@@ -84,7 +84,7 @@ def _severity(pct, n_methods):
 def _describe(item, date, actual, expected, pct, scope, tags=None):
     """알림 한 건을 사람이 읽는 문장으로 만든다.
 
-    tags 는 그 날의 상황(크리스마스시즌·공휴일·비 등). 있으면 원인 설명에 붙인다.
+    tags 는 그 날의 상황(크리스마스시즌, 공휴일, 비 등). 있으면 원인 설명에 붙인다.
     """
     day_kr = "월화수목금토일"[date.dayofweek]
     direction = "많이" if pct > 0 else "적게"
@@ -101,17 +101,17 @@ def _describe(item, date, actual, expected, pct, scope, tags=None):
 
     if pct > 0:
         meaning = "재고가 부족했을 수 있습니다."
-        action = "이런 날이 반복되면 생산·발주량을 늘리는 것을 검토하세요."
-        icon = "📈"
+        action = "이런 날이 반복되면 생산, 발주량을 늘리는 것을 검토하세요."
+        icon = ""
     else:
         meaning = "재고가 남았을 수 있습니다."
-        action = "이런 날이 반복되면 생산·발주량을 줄여 폐기를 줄이세요."
-        icon = "📉"
+        action = "이런 날이 반복되면 생산, 발주량을 줄여 폐기를 줄이세요."
+        icon = ""
 
     if tags:
         # 이유를 아는 날이면 그 이유를 먼저 말해준다.
         # 해마다 돌아오는 대목은 '문제'가 아니라 '준비할 일'이다.
-        what = " · ".join(tags)
+        what = ", ".join(tags)
         cause = f"이 날은 **{what}**이었습니다. "
         if pct > 0:
             cause += "해마다 돌아오는 시기라면 내년 같은 때 미리 넉넉히 준비하세요."
@@ -145,7 +145,7 @@ def build_alerts(daily_by_item, daily_total, target_items, recent_days=30,
     if len(daily_total) < 40:
         return []
 
-    # 매장 전체가 흔들린 날 — 개별 품목의 원인을 가르는 데 쓴다.
+    # 매장 전체가 흔들린 날 - 개별 품목의 원인을 가르는 데 쓴다.
     _, total_combined = run_all_detectors(daily_total, residual_mode="weekday")
     total_bad = set(total_combined.index[total_combined["이상여부"]])
 
@@ -190,7 +190,7 @@ def build_alerts(daily_by_item, daily_total, target_items, recent_days=30,
                 "severity": severity, "tags": tags or [], "is_event": bool(tags), **text,
             })
 
-    # 이유를 모르는 이상을 먼저 보여준다 — 그쪽이 확인이 필요한 쪽이다.
+    # 이유를 모르는 이상을 먼저 보여준다 - 그쪽이 확인이 필요한 쪽이다.
     alerts.sort(key=lambda a: (a["is_event"], SEVERITY_ORDER[a["severity"]], -abs(a["pct"])))
     return alerts[:max_alerts]
 
@@ -220,7 +220,7 @@ def trend_summary(series, weeks=4, min_expected=3.0):
         return {
             "change": change, "direction": "상승",
             "text": f"최근 {weeks}주 판매량이 그 이전 {weeks}주보다 {change * 100:.0f}% 늘었습니다.",
-            "action": "발주·생산량을 늘리지 않으면 품절이 잦아질 수 있습니다.",
+            "action": "발주, 생산량을 늘리지 않으면 품절이 잦아질 수 있습니다.",
         }
     return {
         "change": change, "direction": "하락",
@@ -230,7 +230,7 @@ def trend_summary(series, weeks=4, min_expected=3.0):
 
 
 def weekday_guide(series, weeks=4):
-    """요일별 평균 판매량 — '다음 주 화요일엔 몇 개 준비할까'에 바로 답하는 표."""
+    """요일별 평균 판매량 - '다음 주 화요일엔 몇 개 준비할까'에 바로 답하는 표."""
     recent = series.tail(weeks * 7)
     if len(recent) < 14:
         return None

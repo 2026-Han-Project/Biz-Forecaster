@@ -12,7 +12,7 @@ def _setup_env() -> bool:
         return False
     os.environ["OPENAI_API_KEY"] = api_key
 
-    # LangSmith(추적 도구) — 키가 있을 때만 활성화
+    # LangSmith(추적 도구) - 키가 있을 때만 활성화
     ls_key = st.secrets.get("LANGSMITH_API_KEY", "")
     if ls_key:
         os.environ["LANGSMITH_API_KEY"] = ls_key

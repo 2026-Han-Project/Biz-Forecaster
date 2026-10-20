@@ -9,7 +9,7 @@
 반도체 FDC에서 문턱값 설정이 곧 이 둘의 균형을 어디에 둘 것인가의 문제이고,
 그래서 라인마다 "ARL0는 최소 얼마 이상"처럼 수치 기준을 못박아 관리한다.
 
-라벨 문제와 해법 — 합성 이상 주입(synthetic fault injection)
+라벨 문제와 해법 - 합성 이상 주입(synthetic fault injection)
     실제 판매 데이터에는 '이 날이 진짜 이상이었다'는 정답 라벨이 없다.
     라벨이 없으면 오탐/미탐을 셀 수 없다. 그래서 정상으로 간주한 구간에
     크기와 시점을 아는 이상을 인위적으로 주입하고, 탐지기가 그걸 잡아내는지 측정한다.
@@ -28,12 +28,12 @@ FAULT_TYPES = ("spike", "step", "drift")
 
 
 # -----------------------------------------------------------------------------
-# 1. 합성 이상 주입 — 정답(ground truth)을 아는 검증용 데이터 만들기
+# 1. 합성 이상 주입 - 정답(ground truth)을 아는 검증용 데이터 만들기
 # -----------------------------------------------------------------------------
 
 def inject_faults(series, fault_type="step", n_faults=5, magnitude=2.0,
                   duration=7, seed=42, margin=40):
-    """정상 시계열에 크기·시점을 아는 이상을 주입하고 정답 라벨을 함께 반환한다.
+    """정상 시계열에 크기, 시점을 아는 이상을 주입하고 정답 라벨을 함께 반환한다.
 
     magnitude는 계열 표준편차의 배수다. magnitude=2.0이면 '2시그마짜리 이상'.
 
@@ -85,7 +85,7 @@ def inject_faults(series, fault_type="step", n_faults=5, magnitude=2.0,
             out.iloc[start] += sign * shift
         elif fault_type == "step":
             out.iloc[start:end] += sign * shift
-        else:  # drift — 0에서 shift까지 선형 증가
+        else:  # drift - 0에서 shift까지 선형 증가
             ramp = np.linspace(0.0, shift, span)
             out.iloc[start:end] += sign * ramp
 
@@ -111,7 +111,7 @@ def _label_events(labels):
 
 
 # -----------------------------------------------------------------------------
-# 2. 혼동행렬 · 성능지표
+# 2. 혼동행렬, 성능지표
 # -----------------------------------------------------------------------------
 
 def confusion_counts(labels, flags, tolerance=1):
@@ -143,7 +143,7 @@ def confusion_counts(labels, flags, tolerance=1):
 
 
 def average_run_length(labels, flags):
-    """실측 ARL0 — 정상 구간에서 오경보 한 번이 뜨기까지의 평균 관측 수.
+    """실측 ARL0 - 정상 구간에서 오경보 한 번이 뜨기까지의 평균 관측 수.
 
     ARL0 = 정상일 수 / 오경보 수
 
@@ -210,7 +210,7 @@ def detector_metrics(labels, flags, tolerance=1):
 
 
 # -----------------------------------------------------------------------------
-# 3. 문턱값 스윕 — 트레이드오프 곡선 그리기
+# 3. 문턱값 스윕 - 트레이드오프 곡선 그리기
 # -----------------------------------------------------------------------------
 
 # 탐지기별로 '문턱값 손잡이'가 무엇인지 등록해 둔다.
@@ -247,7 +247,7 @@ def threshold_sweep(series, labels, detector="3시그마", values=None, toleranc
 
     이 표의 요점은 "최적값 하나"가 아니라 어떤 값을 골라도 둘 다 좋아지지는 않는다는
     사실 자체다. 문턱을 조이면 오탐이 줄고 미탐이 늘며, 풀면 반대다.
-    어디를 고를지는 통계가 아니라 비용이 정한다 —
+    어디를 고를지는 통계가 아니라 비용이 정한다 - 
     헛경보 한 번의 비용과 놓친 불량 한 장의 비용 중 무엇이 비싼가.
     """
     if detector not in DETECTOR_KNOBS:

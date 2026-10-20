@@ -1,4 +1,4 @@
-"""Streamlit 로그인 게이트 UI — 회원가입 / 로그인 / 비밀번호 재설정.
+"""Streamlit 로그인 게이트 UI - 회원가입 / 로그인 / 비밀번호 재설정.
 
 app.py 맨 앞에서 require_login()을 부르면, 로그인하지 않은 방문자에게는
 인증 화면만 보이고 그 아래 분석 화면은 아예 그려지지 않는다.
@@ -72,13 +72,13 @@ def _show_dev_code():
     code = st.session_state.get("dev_code")
     if not code:
         return
-    st.warning(f"개발 모드 — 인증코드: **{code}**  (실제 메일은 발송되지 않았습니다)")
+    st.warning(f"개발 모드 - 인증코드: **{code}**  (실제 메일은 발송되지 않았습니다)")
     with st.expander("실제 메일로 받으려면"):
         st.markdown(SETUP_GUIDE)
 
 
 # -----------------------------------------------------------------------------
-# 탭 1 — 로그인
+# 탭 1 - 로그인
 # -----------------------------------------------------------------------------
 
 def _login_tab():
@@ -98,14 +98,14 @@ def _login_tab():
 
 
 # -----------------------------------------------------------------------------
-# 탭 2 — 회원가입 (이메일 인증 2단계)
+# 탭 2 - 회원가입 (이메일 인증 2단계)
 # -----------------------------------------------------------------------------
 
 def _signup_tab():
     pending = st.session_state.get("signup_pending")
 
     if not pending:
-        st.caption("1단계 — 매장 정보를 입력하면 이메일로 6자리 인증코드를 보내드립니다.")
+        st.caption("1단계 - 매장 정보를 입력하면 이메일로 6자리 인증코드를 보내드립니다.")
 
         notice = store.supported_domain_notice()
         if notice:
@@ -121,13 +121,13 @@ def _signup_tab():
         if email and "@" in email:
             domain_ok, domain_msg = store.check_supported_domain(email)
             if not domain_ok:
-                st.warning(f"⚠️ {domain_msg}")
+                st.warning(f"{domain_msg}")
 
         with st.form("signup_form"):
             c1, c2 = st.columns(2)
             pw1 = c1.text_input("비밀번호", type="password", help="8자 이상, 영문+숫자 조합")
             pw2 = c2.text_input("비밀번호 확인", type="password")
-            agree = st.checkbox("업로드한 매출 데이터가 예측·이상탐지 분석에 사용되는 것에 동의합니다.")
+            agree = st.checkbox("업로드한 매출 데이터가 예측, 이상탐지 분석에 사용되는 것에 동의합니다.")
             # 지원하지 않는 도메인이면 버튼 자체를 막는다.
             # 눌러본 뒤 거절당하는 것보다, 애초에 못 누르게 하는 편이 덜 답답하다.
             submitted = st.form_submit_button(
@@ -163,8 +163,8 @@ def _signup_tab():
                 st.rerun()
         return
 
-    # 2단계 — 코드 입력
-    st.caption(f"2단계 — **{pending}** 로 보낸 6자리 코드를 입력해주세요. (유효시간 10분)")
+    # 2단계 - 코드 입력
+    st.caption(f"2단계 - **{pending}** 로 보낸 6자리 코드를 입력해주세요. (유효시간 10분)")
     _show_dev_code()
 
     with st.form("signup_verify_form"):
@@ -196,14 +196,14 @@ def _signup_tab():
         st.balloons()
         st.rerun()
 
-    if st.button("← 처음부터 다시 입력"):
+    if st.button("처음부터 다시 입력"):
         for key in ("signup_pending", "signup_draft", "dev_code"):
             st.session_state.pop(key, None)
         st.rerun()
 
 
 # -----------------------------------------------------------------------------
-# 탭 3 — 비밀번호 재설정
+# 탭 3 - 비밀번호 재설정
 # -----------------------------------------------------------------------------
 
 def _reset_tab():
@@ -261,7 +261,7 @@ def _reset_tab():
         _flash("비밀번호가 변경되었습니다. 로그인 탭에서 로그인해주세요.")
         st.rerun()
 
-    if st.button("← 취소"):
+    if st.button("취소"):
         for key in ("reset_pending", "dev_code"):
             st.session_state.pop(key, None)
         st.rerun()
@@ -277,7 +277,7 @@ def render_sidebar_account():
     if not user:
         return
     with st.sidebar:
-        st.markdown(f"### 🏪 {user['shop_name']}")
+        st.markdown(f"### {user['shop_name']}")
         st.caption(user["email"])
         c1, c2 = st.columns(2)
         if c1.button("계정 설정", use_container_width=True):
@@ -296,8 +296,8 @@ def require_login():
     if user:
         return user
 
-    st.title("🥐 Biz Forecaster")
-    st.caption("소상공인 AI 수요예측 · 이상탐지 플랫폼 — 로그인 후 내 매장 데이터를 분석하세요.")
+    st.title("Biz Forecaster")
+    st.caption("소상공인 AI 수요예측, 이상탐지 플랫폼 - 로그인 후 내 매장 데이터를 분석하세요.")
 
     if not is_configured():
         st.info(
@@ -321,7 +321,7 @@ def require_login():
 
 
 # -----------------------------------------------------------------------------
-# 계정 설정 화면 — 매장명 / 비밀번호 / 이메일 변경, 회원 탈퇴
+# 계정 설정 화면 - 매장명 / 비밀번호 / 이메일 변경, 회원 탈퇴
 # -----------------------------------------------------------------------------
 
 ACCOUNT_VIEW_KEY = "show_account"
@@ -464,12 +464,12 @@ def render_account_page():
     if not user:
         return
 
-    if st.button("← 분석 화면으로 돌아가기"):
+    if st.button("분석 화면으로 돌아가기"):
         close_account_page()
         st.rerun()
 
-    st.title("⚙️ 계정 설정")
-    st.caption(f"{user['shop_name']} · {user['email']} · 가입일 {user['created_at'][:10]}")
+    st.title("계정 설정")
+    st.caption(f"{user['shop_name']}, {user['email']}, 가입일 {user['created_at'][:10]}")
     _drain_flash()
     st.divider()
 
